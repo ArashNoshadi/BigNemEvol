@@ -1,6 +1,5 @@
 # BigNemEvol
-
-# PanNemaEvol: Big  Nematode  Evolution Macroevolutionary & Phylogenomic Pipeline
+## Big  Nematode  Evolution Macroevolutionary & Phylogenomic Pipeline
 
 
 Official code repository for the macroevolutionary and phylogenomic analyses described in our manuscript evaluating the deep evolutionary fluidity and reversibility of parasitism across the phylum Nematoda.
