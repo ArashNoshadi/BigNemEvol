@@ -65,13 +65,11 @@ The R scripts encompass the core statistical framework used to test Dollo's Law 
 * **Phylogenetic Regression:** Uses robust PGLS (incorporating `varIdent` structures) to evaluate the decoupling of genome size from mutational turnover.
 * **Diversification Dynamics:** Calculates Pybus & Harvey’s γ statistic and compares Yule vs. Birth-Death models via `diversitree`.
 
-## 💾 Data Availability
-Due to GitHub file size limits (>100 MB), the raw unaligned supermatrices, extensive fasta assemblies, and intermediate bootstrap trees are hosted on **[Zenodo/Figshare - Insert Link Here]**. The `data/` folder in this repository contains the final curated metadata, trait data, and finalized consensus trees required to reproduce the statistical analyses in R.
+
 
 ## 📝 Citation
 If you use the code or data in this repository, please cite our paper:
 > **[Author Names]** (2026). *[Paper Title]*. Nature Genetics. DOI: [Insert DOI]
 
 ## 📜 License
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-```
+This project is licensed under the MIT License
