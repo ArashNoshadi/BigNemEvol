@@ -2,8 +2,6 @@
 
 # PanNemaEvol: Nematode Macroevolutionary & Phylogenomic Pipeline
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Data: Zenodo](https://img.shields.io/badge/Data-Zenodo-blue.svg)](https://zenodo.org/)
 
 Official code repository for the macroevolutionary and phylogenomic analyses described in our manuscript evaluating the deep evolutionary fluidity and reversibility of parasitism across the phylum Nematoda.
 
