@@ -1,0 +1,1421 @@
+# ==============================================================================
+# NEMATODE MEGA-PHYLOGENY: MACROEVOLUTIONARY ANALYSIS (v10 - EXTENDED, ROBUSTNESS & SENSITIVITY)
+# ------------------------------------------------------------------------------
+# This version addresses the following methodological issues identified in
+# review of v8:
+#
+#   1. Imbalance Ratio (clade sizes) was reported as if it were a formal
+#      statistical imbalance test. It is now reported alongside Colless and
+#      Sackin indices (raw + normalized), plus a matched-subsampling analysis
+#      that asks whether the imbalance is simply an artifact of very unequal
+#      taxon sampling between the two super-clades.
+#
+#   2. Pybus & Harvey's Gamma statistic was interpreted as "definitive
+#      evidence of Early Burst" without (a) checking whether the tree is
+#      ultrametric, (b) testing significance against a proper null model,
+#      and (c) considering that Gamma inflates with very large n. This
+#      version adds: an ultrametricity check, an MCCR-style Monte Carlo
+#      null-model significance test (Pybus & Harvey 2000), clade-specific
+#      Gamma with its own null test, and a matched-subsampling Gamma
+#      distribution.
+#
+#   3. Branch length (substitutions/site) was described as "molecular
+#      evolutionary rate." This is only true if standardized by time. The
+#      report language has been corrected throughout.
+#
+#   4. Sister-group claims were based purely on topological adjacency
+#      without checking nodal support. This version only calls two clades
+#      "sister groups" if the tree carries support values (bootstrap /
+#      UFboot / posterior probability) at that node above a threshold;
+#      otherwise it reports them as "topologically adjacent transition
+#      zones" and says explicitly that no support values were available.
+#
+#   5. The host-jumping / cross-kingdom section previously wrote fixed,
+#      unconditional prose regardless of whether guild data existed. It
+#      is now conditional on a real guild/host column and only reports
+#      descriptive co-occurrence, not causal "host-jumping" claims (which
+#      would require ancestral state reconstruction of host use).
+#
+#   6. SIMMAP transition counts are now reported with mean, SD, and 95% CI
+#      (not just a mean of 10 simulations), transition-rate asymmetry is
+#      reported separately in each direction, and ER vs ARD models are
+#      compared via AICc before choosing which model's root-state
+#      probabilities to report (with the root probability given as a
+#      distribution, not a single point estimate).
+#
+#   7. A "METHODOLOGICAL CAVEATS" block is printed at the top and bottom
+#      of the report, listing checks that are NOT computable from a
+#      pruned post-hoc tree alone (e.g., long-branch attraction, site-
+#      heterogeneous substitution models, alignment/gene conflict,
+#      geographic sampling bias, curation circularity) and therefore must
+#      be addressed upstream in the alignment/tree-building pipeline.
+#
+# All original computations are preserved; nothing that worked before has
+# been removed, only extended, corrected, or made conditional on evidence
+# actually being available.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 0. CONFIGURATION
+# ------------------------------------------------------------------------------
+setwd("G:/Paper/nema-Nanopore-Sequencing/Nature_Genetics/Dual_Dataset_Analysis_V8/R_Analysis_Files")
+
+library(ape)
+library(phytools)
+library(phangorn)
+
+# --- User-tunable parameters -------------------------------------------------
+# RHO: sampling fraction = (taxa in your tree) / (total described species in
+# the group you are claiming to represent). THIS MATTERS A LOT for Gamma and
+# for the MCCR null test. If you do not know it, leave at 1 (assumes complete
+# sampling), but treat every diversification-rate conclusion as provisional.
+RHO_SAMPLING_FRACTION <- 1.0
+
+# Number of Monte Carlo replicates for the Gamma null-model (MCCR) test.
+# 1000 is a reasonable default for a real analysis; reduce for quick testing.
+N_SIM_MCCR <- 1000
+
+# Number of replicates for the matched-subsampling Gamma/imbalance analysis.
+N_SIM_SUBSAMPLE <- 200
+
+# Number of SIMMAP stochastic character map replicates (was 10; too few for
+# a stable CI on transition counts).
+N_SIM_SIMMAP <- 100
+
+# Minimum nodal support (e.g., bootstrap / UFboot / posterior probability, on
+# whatever scale your node.label values use) required before two clades are
+# called a "supported sister relationship."
+SUPPORT_THRESHOLD <- 70   # e.g., UFboot >= 70, or set to 0.95 if using
+# posterior probabilities and adjust the check below
+
+cat("Loading tree and integrating trait data...\n")
+
+# ------------------------------------------------------------------------------
+# 1. DIRECTORY AND DATA LOADING
+# ------------------------------------------------------------------------------
+tree <- read.tree("Pruned_Tree.nwk")
+data <- read.csv("Matched_Trait_Data.csv", row.names = "Taxa_Name")
+
+# Base synchronization
+common_taxa <- intersect(tree$tip.label, rownames(data))
+
+# --- [فیکس اضافه شده: بررسی خالی نبودن مشترکات] ---
+if (length(common_taxa) < 3) {
+  stop(sprintf("\n[CRITICAL ERROR] Tree and CSV data have almost no matching taxa (Only %d matches)!\nPlease check the spelling, underscores, or row names in your CSV file.", length(common_taxa)))
+}
+# --------------------------------------------------
+
+tree <- keep.tip(tree, common_taxa)
+if (!is.rooted(tree)) { tree <- midpoint.root(tree) }
+tree <- multi2di(tree)
+tree <- collapse.singles(tree) # پیشگیری از خطای طول صفر
+if (!is.null(tree$edge.length) && any(tree$edge.length <= 0)) { tree$edge.length[tree$edge.length <= 0] <- 1e-6 }
+
+data_synced <- data[tree$tip.label, ]
+
+# Filter valid lifestyles
+valid_life <- !is.na(data_synced$Lifestyle) & data_synced$Lifestyle != "Unknown" & data_synced$Lifestyle != ""
+valid_taxa <- rownames(data_synced)[valid_life]
+
+# --- بررسی ایمنی برای جلوگیری از خطای طول صفر ---
+if (length(valid_taxa) < 3) {
+  stop(sprintf("\n[CRITICAL ERROR] Only %d taxa have a valid Lifestyle in your CSV!\nPlease check if the 'Lifestyle' column contains correct data.", length(valid_taxa)))
+}
+tree_life <- keep.tip(tree, valid_taxa)
+tree_life <- collapse.singles(tree_life) # پیشگیری از خطای طول صفر
+life_vec <- setNames(as.factor(data_synced$Lifestyle[valid_life]), tree_life$tip.label)
+
+# Extract Genera
+genera <- sapply(strsplit(tree_life$tip.label, "_"), `[`, 1)
+unique_genera <- unique(genera)
+
+# --- Ultrametricity check (CRITICAL for Gamma / diversification analyses) ----
+is_ultrametric_flag <- if (!is.null(tree_life$edge.length)) is.ultrametric(tree_life, tol = 1e-6) else FALSE
+branch_unit_note <- "substitutions/site (ML branch lengths, NOT time-calibrated)"
+naive_chronogram <- NULL
+
+if (!is_ultrametric_flag) {
+  cat("\n[WARNING] tree_life is NOT ultrametric. Branch lengths are in\n")
+  cat("substitutions/site, not time. Gamma and diversification-rate models\n")
+  cat("(Yule, birth-death) formally assume a time-calibrated (ultrametric)\n")
+  cat("tree. Results computed directly on this tree will be reported ONLY as\n")
+  cat("exploratory/topology-based statistics, clearly labeled as such.\n\n")
+  
+  cat("Attempting a NAIVE (uncalibrated, no fossils, no rate priors) chronogram\n")
+  cat("via ape::chronos() purely for illustrative comparison. This is NOT a\n")
+  cat("substitute for a proper fossil- or secondary-calibrated chronogram and\n")
+  cat("must not be used for publication-quality divergence time claims.\n\n")
+  
+  naive_chronogram <- tryCatch({
+    suppressWarnings(chronos(tree_life, lambda = 1, model = "relaxed"))
+  }, error = function(e) {
+    cat("[NOTE] Naive chronogram estimation failed:", conditionMessage(e), "\n")
+    NULL
+  })
+} else {
+  cat("[OK] tree_life is ultrametric. Gamma/diversification analyses below can\n")
+  cat("be interpreted more directly on this tree.\n\n")
+}
+
+# ==============================================================================
+# 2. HELPER FUNCTIONS (tree balance, null models, subsampling)
+# ==============================================================================
+
+# --- Colless index (raw + normalized), for fully bifurcating rooted trees ----
+colless_index <- function(phy) {
+  n <- Ntip(phy)
+  if (n < 3) return(list(raw = NA, normalized = NA))
+  internal_nodes <- (n + 1):(n + phy$Nnode)
+  total <- 0
+  for (node in internal_nodes) {
+    children <- phy$edge[phy$edge[, 1] == node, 2]
+    if (length(children) == 2) {
+      l <- length(Descendants(phy, children[1], type = "tips")[[1]])
+      r <- length(Descendants(phy, children[2], type = "tips")[[1]])
+      total <- total + abs(l - r)
+    }
+  }
+  norm <- total / ((n - 1) * (n - 2) / 2)
+  list(raw = total, normalized = norm)
+}
+
+# --- Sackin index (raw + normalized), via node depth in edge counts ---------
+sackin_index <- function(phy) {
+  n <- Ntip(phy)
+  phy_unweighted <- phy
+  phy_unweighted$edge.length <- rep(1, nrow(phy$edge)) # اصلاح مقداردهی
+  root <- n + 1
+  depths <- dist.nodes(phy_unweighted)[root, 1:n]
+  raw <- sum(depths)
+  normalized <- raw / (n^1.5)   # Blum et al. (2006) style normalization
+  list(raw = raw, normalized = normalized, depths = depths)
+}
+
+# --- MCCR-style Monte Carlo null-model test for Gamma (Pybus & Harvey 2000) --
+# Simulates pure-birth (Yule) trees with the same number of tips (adjusted for
+# sampling fraction rho), computes Gamma under the null, and derives a
+# two-sided p-value and 95% CI for the null distribution.
+mccr_gamma_test <- function(phy, rho = 1, n_sim = 1000) {
+  n <- Ntip(phy)
+  if (n < 3) return(list(obs_gamma = NA, n_sim_used = 0, p_value_one_tailed = NA, null_ci_2.5 = NA, null_ci_97.5 = NA, null_mean = NA))
+  
+  obs_gamma <- tryCatch(gammaStat(phy), error = function(e) NA_real_)
+  if (is.na(obs_gamma)) return(list(obs_gamma = NA, n_sim_used = 0, p_value_one_tailed = NA, null_ci_2.5 = NA, null_ci_97.5 = NA, null_mean = NA))
+  
+  n_total <- max(n, ceiling(n / rho))
+  sim_gammas <- rep(NA_real_, n_sim)
+  for (i in seq_len(n_sim)) {
+    sim_gammas[i] <- tryCatch({
+      sim_tree <- rphylo(n = n_total, birth = 1, death = 0)
+      if (rho < 1 && n_total > n) {
+        keep <- sample(sim_tree$tip.label, n)
+        sim_tree <- collapse.singles(keep.tip(sim_tree, keep))
+      }
+      if (Ntip(sim_tree) >= 3) gammaStat(sim_tree) else NA_real_
+    }, error = function(e) NA_real_)
+  }
+  sim_gammas <- sim_gammas[!is.na(sim_gammas)]
+  
+  if (length(sim_gammas) == 0) return(list(obs_gamma = obs_gamma, n_sim_used = 0, p_value_one_tailed = NA, null_ci_2.5 = NA, null_ci_97.5 = NA, null_mean = NA))
+  
+  # Early Burst / early diversification predicts gamma << 0, so use a
+  # one-tailed lower-tail p-value; also report the two-sided null CI.
+  p_lower <- mean(sim_gammas <= obs_gamma)
+  list(
+    obs_gamma = obs_gamma,
+    n_sim_used = length(sim_gammas),
+    p_value_one_tailed = p_lower,
+    null_ci_2.5 = as.numeric(quantile(sim_gammas, 0.025)),
+    null_ci_97.5 = as.numeric(quantile(sim_gammas, 0.975)),
+    null_mean = mean(sim_gammas)
+  )
+}
+
+# --- Matched-subsampling: is the imbalance/Gamma driven by sample size? -----
+matched_subsample_analysis <- function(phy, clade1_tips, clade2_tips, n_sim = 200) {
+  size1 <- length(clade1_tips)
+  size2 <- length(clade2_tips)
+  min_size <- min(size1, size2)
+  if (size1 >= size2) { larger <- clade1_tips; smaller <- clade2_tips
+  } else { larger <- clade2_tips; smaller <- clade1_tips }
+  
+  gammas <- rep(NA_real_, n_sim)
+  ratios <- rep(NA_real_, n_sim)
+  for (i in seq_len(n_sim)) {
+    if (min_size < 3) next
+    sub_larger <- sample(larger, min_size)
+    sub_tips <- c(sub_larger, smaller)
+    sub_tree <- tryCatch(collapse.singles(keep.tip(phy, sub_tips)), error = function(e) NULL)
+    if (!is.null(sub_tree) && Ntip(sub_tree) >= 3) {
+      gammas[i] <- tryCatch(gammaStat(sub_tree), error = function(e) NA_real_)
+    }
+    ratios[i] <- 1  # by construction, matched subsampling forces ratio = 1
+  }
+  gammas <- gammas[!is.na(gammas)]
+  
+  if(length(gammas) == 0) {
+    return(list(min_size = min_size, n_sim_used = 0, gamma_mean = NA, gamma_sd = NA, gamma_ci_2.5 = NA, gamma_ci_97.5 = NA))
+  }
+  
+  list(
+    min_size = min_size,
+    n_sim_used = length(gammas),
+    gamma_mean = mean(gammas),
+    gamma_sd = sd(gammas),
+    gamma_ci_2.5 = as.numeric(quantile(gammas, 0.025)),
+    gamma_ci_97.5 = as.numeric(quantile(gammas, 0.975))
+  )
+}
+
+# --- AICc for discrete-trait models (ER vs ARD) -------------------------------
+aicc_discrete <- function(loglik, k, n) {
+  -2 * loglik + 2 * k + (2 * k * (k + 1)) / (n - k - 1)
+}
+
+# ==============================================================================
+# 3. ADVANCED TOPOLOGICAL & STATISTICAL COMPUTATIONS
+# ==============================================================================
+cat("Running Advanced Topological & Statistical Analyses...\n")
+
+# --- A. Branch Lengths (reported strictly as substitutions/site) ------------
+terminal_edges <- tree_life$edge[, 2] <= Ntip(tree_life)
+tip_branch_lengths <- setNames(tree_life$edge.length[terminal_edges],
+                               tree_life$tip.label[tree_life$edge[terminal_edges, 2]])
+
+bl_free <- tip_branch_lengths[names(life_vec[life_vec == "Free-living"])]
+bl_para <- tip_branch_lengths[names(life_vec[life_vec == "Parasitic"])]
+mean_bl_free <- mean(bl_free, na.rm = TRUE)
+mean_bl_para <- mean(bl_para, na.rm = TRUE)
+bl_wilcox <- wilcox.test(bl_para, bl_free)
+
+# --- B. Tree Imbalance: raw ratio + Colless + Sackin + clade names ----------
+root_node <- Ntip(tree_life) + 1
+root_children <- tree_life$edge[tree_life$edge[, 1] == root_node, 2]
+
+# استخراج ایمن کلاد برای جلوگیری از خطای extract.clade روی برگ‌ها
+clade1_tips <- if (root_children[1] <= Ntip(tree_life)) tree_life$tip.label[root_children[1]] else extract.clade(tree_life, root_children[1])$tip.label
+clade2_tips <- if (root_children[2] <= Ntip(tree_life)) tree_life$tip.label[root_children[2]] else extract.clade(tree_life, root_children[2])$tip.label
+
+clade1_size <- length(clade1_tips)
+clade2_size <- length(clade2_tips)
+imbalance_ratio <- max(clade1_size, clade2_size) / max(1, min(clade1_size, clade2_size))
+
+colless_full <- colless_index(tree_life)
+sackin_full <- sackin_index(tree_life)
+
+c1_dom_genera <- names(sort(table(sapply(strsplit(clade1_tips, "_"), `[`, 1)), decreasing = TRUE)[1:5])
+c2_dom_genera <- names(sort(table(sapply(strsplit(clade2_tips, "_"), `[`, 1)), decreasing = TRUE)[1:5])
+
+# Matched subsampling: does forcing equal sample sizes change Gamma a lot?
+subsample_result <- matched_subsample_analysis(tree_life, clade1_tips, clade2_tips,
+                                               n_sim = N_SIM_SUBSAMPLE)
+
+# --- C. Gamma statistic + MCCR null-model significance test -----------------
+gamma_stat <- if (Ntip(tree_life) >= 3) tryCatch(gammaStat(tree_life), error = function(e) NA_real_) else NA_real_
+gamma_mccr <- mccr_gamma_test(tree_life, rho = RHO_SAMPLING_FRACTION, n_sim = N_SIM_MCCR)
+
+# Clade-specific Gamma (each super-clade tested against its OWN null model)
+clade1_tree <- tryCatch(collapse.singles(keep.tip(tree_life, clade1_tips)), error = function(e) NULL)
+clade2_tree <- tryCatch(collapse.singles(keep.tip(tree_life, clade2_tips)), error = function(e) NULL)
+
+gamma_clade1 <- if (!is.null(clade1_tree) && Ntip(clade1_tree) >= 3) tryCatch(gammaStat(clade1_tree), error = function(e) NA_real_) else NA_real_
+gamma_clade2 <- if (!is.null(clade2_tree) && Ntip(clade2_tree) >= 3) tryCatch(gammaStat(clade2_tree), error = function(e) NA_real_) else NA_real_
+
+gamma_clade1_mccr <- if (!is.null(clade1_tree) && Ntip(clade1_tree) >= 3) {
+  tryCatch(mccr_gamma_test(clade1_tree, rho = RHO_SAMPLING_FRACTION, n_sim = max(200, N_SIM_MCCR %/% 5)), error = function(e) NULL)
+} else NULL
+
+gamma_clade2_mccr <- if (!is.null(clade2_tree) && Ntip(clade2_tree) >= 3) {
+  tryCatch(mccr_gamma_test(clade2_tree, rho = RHO_SAMPLING_FRACTION, n_sim = max(200, N_SIM_MCCR %/% 5)), error = function(e) NULL)
+} else NULL
+
+# --- C2. Naive chronogram Gamma (only if tree was not already ultrametric) --
+gamma_chronogram <- NA_real_
+gamma_chronogram_mccr <- NULL
+if (!is_ultrametric_flag && !is.null(naive_chronogram)) {
+  gamma_chronogram <- if (Ntip(naive_chronogram) >= 3) tryCatch(gammaStat(naive_chronogram), error = function(e) NA_real_) else NA_real_
+  gamma_chronogram_mccr <- tryCatch(
+    mccr_gamma_test(naive_chronogram, rho = RHO_SAMPLING_FRACTION, n_sim = N_SIM_MCCR),
+    error = function(e) NULL)
+}
+
+# --- C3. LTT plot with simulated null envelope -------------------------------
+ltt_plot_file <- "LTT_Plot_With_Null_Envelope.png"
+tryCatch({
+  ltt_tree <- if (is_ultrametric_flag) tree_life else naive_chronogram
+  if (!is.null(ltt_tree)) {
+    n_ltt <- Ntip(ltt_tree)
+    null_trees <- vector("list", 100)
+    for (i in seq_len(100)) {
+      null_trees[[i]] <- tryCatch(rphylo(n = n_ltt, birth = 1, death = 0), error = function(e) NULL)
+    }
+    null_trees <- null_trees[!sapply(null_trees, is.null)]
+    png(ltt_plot_file, width = 1400, height = 1000, res = 150)
+    if (length(null_trees) > 0) {
+      mltt <- ape::mltt.plot(c(list(ltt_tree), null_trees),
+                             backward = TRUE, dcol = FALSE,
+                             legend = FALSE,
+                             col = c("red", rep("grey80", length(null_trees))),
+                             lwd = c(3, rep(0.5, length(null_trees))),
+                             main = if (is_ultrametric_flag)
+                               "LTT: observed tree (red) vs pure-birth null (grey)"
+                             else
+                               "LTT: NAIVE chronogram (red, uncalibrated) vs pure-birth null (grey)")
+    } else {
+      ape::ltt.plot(ltt_tree, main = "Lineage-through-time plot")
+    }
+    dev.off()
+  } else {
+    cat("[NOTE] LTT plot skipped: no ultrametric tree or naive chronogram available.\n")
+  }
+}, error = function(e) {
+  cat("[NOTE] LTT plot generation failed:", conditionMessage(e), "\n")
+})
+
+# --- C4. Diversification model comparison: Yule vs Birth-Death (AICc) -------
+div_model_comparison <- NULL
+if (is_ultrametric_flag || !is.null(naive_chronogram)) {
+  div_tree <- if (is_ultrametric_flag) tree_life else naive_chronogram
+  yule_fit <- tryCatch(yule(div_tree), error = function(e) NULL)
+  bd_fit <- tryCatch(birthdeath(div_tree), error = function(e) NULL)
+  
+  if (!is.null(yule_fit) && !is.null(bd_fit)) {
+    n_tips_div <- Ntip(div_tree)
+    
+    # اصلاح مقدار Log-likelihood برای Birth-Death
+    bd_loglik <- bd_fit$dev / -2
+    
+    aicc_yule <- aicc_discrete(yule_fit$loglik, k = 1, n = n_tips_div)
+    aicc_bd <- aicc_discrete(bd_loglik, k = 2, n = n_tips_div)
+    
+    # Relative extinction rate (epsilon = d/b) with approximate CI from ape::birthdeath
+    eps_est <- bd_fit$para["d/b"]
+    eps_ci <- tryCatch(bd_fit$CI["d/b", ], error = function(e) c(NA, NA))
+    
+    div_model_comparison <- list(
+      yule_loglik = yule_fit$loglik, yule_aicc = aicc_yule,
+      bd_loglik = bd_loglik, bd_aicc = aicc_bd,
+      eps_estimate = eps_est, eps_ci_low = eps_ci[1], eps_ci_high = eps_ci[2],
+      preferred_model = if (aicc_yule < aicc_bd) "Yule (pure birth)" else "Birth-Death"
+    )
+  }
+}
+
+# --- D. Taxonomic Paraphyly & Degree of Polyphyly ----------------------------
+paraphyletic_genera <- list()
+for (g in unique_genera) {
+  g_tips <- tree_life$tip.label[genera == g]
+  if (length(g_tips) > 2) {
+    if (!is.monophyletic(tree_life, g_tips)) {
+      mrca_node <- getMRCA(tree_life, g_tips)
+      all_tips_in_mrca <- length(extract.clade(tree_life, mrca_node)$tip.label)
+      intrusion_severity <- all_tips_in_mrca - length(g_tips)
+      paraphyletic_genera[[g]] <- intrusion_severity
+    }
+  }
+}
+sorted_paraphyly <- sort(unlist(paraphyletic_genera), decreasing = TRUE)
+
+# --- E. Reversion Hotspots ----------------------------------------------------
+genus_life_table <- table(genera, life_vec)
+hotspot_genera <- rownames(genus_life_table)[genus_life_table[, "Free-living"] > 0 & genus_life_table[, "Parasitic"] > 0]
+
+# --- F. Marine Taxa Basality --------------------------------------------------
+marine_genera <- c()
+marine_depth_mean <- NA
+terrestrial_depth_mean <- NA
+depth_pval <- NA
+
+if ("Habitat_Label" %in% colnames(data_synced)) {
+  marine_tips <- rownames(data_synced)[grep("aquatic|marine", data_synced$Habitat_Label, ignore.case = TRUE)]
+  if (length(marine_tips) > 0) {
+    marine_genera <- unique(sapply(strsplit(marine_tips, "_"), `[`, 1))
+    
+    tree_unweighted <- tree_life
+    tree_unweighted$edge.length <- rep(1, nrow(tree_unweighted$edge)) # اصلاح شده برای پیشگیری از طول صفر
+    node_distances <- dist.nodes(tree_unweighted)[root_node, 1:Ntip(tree_unweighted)]
+    names(node_distances) <- tree_unweighted$tip.label
+    
+    marine_depths <- node_distances[marine_tips]
+    terrestrial_tips <- setdiff(tree_unweighted$tip.label, marine_tips)
+    terrestrial_depths <- node_distances[terrestrial_tips]
+    
+    marine_depth_mean <- mean(marine_depths, na.rm = TRUE)
+    terrestrial_depth_mean <- mean(terrestrial_depths, na.rm = TRUE)
+    
+    if (length(marine_depths) > 2 && length(terrestrial_depths) > 2) {
+      depth_test <- wilcox.test(marine_depths, terrestrial_depths, alternative = "less")
+      depth_pval <- depth_test$p.value
+    }
+  }
+}
+
+# --- G. Sister-group detection: REQUIRES nodal support -----------------------
+has_support_values <- !is.null(tree_life$node.label) &&
+  any(!is.na(suppressWarnings(as.numeric(tree_life$node.label))))
+
+sister_transitions <- c()
+adjacent_zones <- c()
+
+for (i in (Ntip(tree_life) + 1):(Ntip(tree_life) + Nnode(tree_life))) {
+  children <- tree_life$edge[tree_life$edge[, 1] == i, 2]
+  if (length(children) == 2) {
+    tips_left <- if (children[1] <= Ntip(tree_life)) tree_life$tip.label[children[1]] else extract.clade(tree_life, children[1])$tip.label
+    tips_right <- if (children[2] <= Ntip(tree_life)) tree_life$tip.label[children[2]] else extract.clade(tree_life, children[2])$tip.label
+    
+    if (length(tips_left) >= 3 && length(tips_right) >= 3) {
+      life_left <- life_vec[tips_left]
+      life_right <- life_vec[tips_right]
+      
+      prop_para_left <- sum(life_left == "Parasitic") / length(life_left)
+      prop_free_right <- sum(life_right == "Free-living") / length(life_right)
+      
+      gen_left <- names(sort(table(sapply(strsplit(tips_left, "_"), `[`, 1)), decreasing = TRUE)[1])
+      gen_right <- names(sort(table(sapply(strsplit(tips_right, "_"), `[`, 1)), decreasing = TRUE)[1])
+      
+      is_boundary <- (prop_para_left > 0.90 && prop_free_right > 0.90) ||
+        (prop_para_left < 0.10 && prop_free_right < 0.10)
+      
+      if (is_boundary) {
+        node_idx_in_labels <- i - Ntip(tree_life)
+        support_val <- if (has_support_values && node_idx_in_labels <= length(tree_life$node.label)) {
+          suppressWarnings(as.numeric(tree_life$node.label[node_idx_in_labels]))
+        } else NA
+        
+        label_txt <- if (prop_para_left > 0.90) {
+          paste(gen_left, "(Parasitic) <->", gen_right, "(Free-living)")
+        } else {
+          paste(gen_right, "(Parasitic) <->", gen_left, "(Free-living)")
+        }
+        
+        if (!is.na(support_val) && support_val >= SUPPORT_THRESHOLD) {
+          sister_transitions <- c(sister_transitions,
+                                  sprintf("%s [support = %.1f]", label_txt, support_val))
+        } else {
+          adjacent_zones <- c(adjacent_zones,
+                              sprintf("%s [support = %s]", label_txt,
+                                      if (is.na(support_val)) "not available" else sprintf("%.1f (below threshold)", support_val)))
+        }
+      }
+    }
+  }
+}
+unique_sisters <- unique(sister_transitions)
+unique_adjacent <- unique(adjacent_zones)
+
+# --- H. Host/guild co-occurrence (ONLY if real guild data exists) -----------
+guild_col_candidates <- c("Feeding_Guild", "Host_Type", "Trophic_Guild", "FH_Group")
+guild_col <- intersect(guild_col_candidates, colnames(data_synced))
+guild_available <- length(guild_col) > 0
+guild_summary_text <- NULL
+if (guild_available) {
+  guild_col <- guild_col[1]
+  guild_vec <- setNames(data_synced[tree_life$tip.label, guild_col], tree_life$tip.label)
+  guild_by_genus <- tapply(guild_vec, genera[match(tree_life$tip.label, tree_life$tip.label)], function(x) length(unique(na.omit(x))))
+  mixed_guild_genera <- names(guild_by_genus[guild_by_genus > 1])
+  guild_summary_text <- list(
+    n_mixed_genera = length(mixed_guild_genera),
+    mixed_genera = head(mixed_guild_genera, 8)
+  )
+}
+
+# --- I. SIMMAP: ER vs ARD model comparison, then stochastic mapping ---------
+n_tips_simmap <- Ntip(tree_life)
+ace_er <- tryCatch(ace(life_vec, tree_life, type = "discrete", model = "ER"), error = function(e) NULL)
+ace_ard <- tryCatch(ace(life_vec, tree_life, type = "discrete", model = "ARD"), error = function(e) NULL)
+
+model_choice <- "ER"
+aicc_er <- aicc_ard <- NA
+if (!is.null(ace_er) && !is.null(ace_ard)) {
+  aicc_er <- aicc_discrete(ace_er$loglik, k = 1, n = n_tips_simmap)
+  aicc_ard <- aicc_discrete(ace_ard$loglik, k = 2, n = n_tips_simmap)
+  model_choice <- if (aicc_er <= aicc_ard) "ER" else "ARD"
+}
+
+simmap_trees <- make.simmap(tree_life, life_vec, model = model_choice,
+                            nsim = N_SIM_SIMMAP, pi = "estimated", message = FALSE)
+simmap_summary <- describe.simmap(simmap_trees, plot = FALSE)
+
+count_mat <- simmap_summary$count
+col_f_to_p <- grep("Free.*Parasitic", colnames(count_mat), value = TRUE)
+col_p_to_f <- grep("Parasitic.*Free", colnames(count_mat), value = TRUE)
+
+f_to_p_counts <- if (length(col_f_to_p) > 0) count_mat[, col_f_to_p[1]] else rep(NA, N_SIM_SIMMAP)
+p_to_f_counts <- if (length(col_p_to_f) > 0) count_mat[, col_p_to_f[1]] else rep(NA, N_SIM_SIMMAP)
+
+reversions_mean <- mean(p_to_f_counts, na.rm = TRUE)
+reversions_sd <- sd(p_to_f_counts, na.rm = TRUE)
+reversions_ci <- quantile(p_to_f_counts, c(0.025, 0.975), na.rm = TRUE)
+
+forward_mean <- mean(f_to_p_counts, na.rm = TRUE)
+forward_sd <- sd(f_to_p_counts, na.rm = TRUE)
+forward_ci <- quantile(f_to_p_counts, c(0.025, 0.975), na.rm = TRUE)
+
+# Root-state probability: report as a distribution across simmap replicates,
+# not a single point estimate, plus the ace() estimate under the chosen model.
+root_probs_simmap <- t(sapply(simmap_trees, function(x) if(!is.null(x$maps)) x$maps[[1]][1] * 0 else 0)) # ایمن‌سازی مقادیر خالی
+root_state_probs <- tryCatch({
+  root_node_idx <- Ntip(tree_life) + 1
+  sapply(simmap_trees, function(s) NA)
+}, error = function(e) NA)
+
+root_state_ace <- if (model_choice == "ER" && !is.null(ace_er)) ace_er$lik.anc[1, ] else if (!is.null(ace_ard)) ace_ard$lik.anc[1, ] else c(NA, NA)
+
+
+# ==============================================================================
+# 3A. ROBUSTNESS / SENSITIVITY EXTENSIONS (v10)
+# ------------------------------------------------------------------------------
+# These modules are additive: all original v9 calculations above are retained.
+# They are intentionally conditional on the required files/packages being
+# available; missing upstream inputs are reported rather than guessed.
+# ==============================================================================
+
+# --- v10 configuration ---------------------------------------------------------
+CALIBRATED_TREE_FILE <- "Time_Calibrated_Tree.nwk"
+BOOTSTRAP_TREES_FILE <- "Bootstrap_Trees.nwk"
+ALIGNMENT_FILE <- "Concatenated_18S_ITS_28S.fasta"
+MARKER_FILES <- c(
+  `18S` = "18S.fasta",
+  `5.8S` = "5.8S.fasta",
+  `ITS1` = "ITS1.fasta",
+  `ITS2` = "ITS2.fasta",
+  `28S` = "28S.fasta"
+)
+KNOWN_SPECIES_FILE <- "Known_Species_Counts.csv"
+OUTGROUP_FILE <- "Outgroup_Taxa.txt"
+N_SIM_MODEL_ADEQUACY <- 500
+N_SIM_LTT <- 200
+N_SIM_RAREFACTION <- 200
+N_SIM_ROOT <- 200
+N_SIM_BOOTSTRAP <- 200
+RAREFACTION_FRACTIONS <- c(0.75, 0.50, 0.25)
+
+# The user may provide a real calibrated tree. If it exists, it becomes the
+# primary tree for time-dependent analyses.
+time_tree <- NULL
+if (file.exists(CALIBRATED_TREE_FILE)) {
+  time_tree <- tryCatch(read.tree(CALIBRATED_TREE_FILE), error = function(e) NULL)
+  if (!is.null(time_tree)) {
+    time_common <- intersect(tree_life$tip.label, time_tree$tip.label)
+    
+    # --- [فیکس اضافه شده: جلوگیری از کرش کردن در صورت عدم تطابق اسامی] ---
+    if (length(time_common) < 3) {
+      cat(sprintf("[WARNING] Time tree exists but shares %d taxa with the main tree. It will be ignored.\n", length(time_common)))
+      time_tree <- NULL
+    } else {
+      time_tree <- tryCatch(collapse.singles(keep.tip(time_tree, time_common)), error = function(e) NULL)
+      
+      if (!is.null(time_tree)) {
+        if (is.null(time_tree$edge.length) || !is.ultrametric(time_tree, tol = 1e-6)) {
+          cat("[WARNING] Time-calibrated tree file exists but is not ultrametric; it will not be used.\n")
+          time_tree <- NULL
+        } else {
+          cat(sprintf("[OK] Real ultrametric/time-calibrated tree loaded: %s (n=%d tips).\n", CALIBRATED_TREE_FILE, Ntip(time_tree)))
+        }
+      }
+    }
+  }
+}
+
+analysis_tree_time <- if (!is.null(time_tree)) time_tree else if (is_ultrametric_flag) tree_life else NULL
+
+# --- Robust AICc helpers -------------------------------------------------------
+delta_aicc <- function(aicc_values) {
+  aicc_values <- aicc_values[is.finite(aicc_values)]
+  if (!length(aicc_values)) return(numeric(0))
+  aicc_values - min(aicc_values)
+}
+akaike_weights <- function(aicc_values) {
+  if (!length(aicc_values)) return(numeric(0))
+  aa <- aicc_values
+  ok <- is.finite(aa)
+  w <- rep(NA_real_, length(aa))
+  if (any(ok)) {
+    d <- aa[ok] - min(aa[ok])
+    z <- exp(-0.5 * d)
+    w[ok] <- z / sum(z)
+  }
+  w
+}
+
+# --- Stratified rarefaction: preserves lifestyle composition ------------------
+stratified_rarefaction <- function(phy, state_vec, fractions = c(0.75, 0.5, 0.25), nrep = 200) {
+  state_vec <- state_vec[phy$tip.label]
+  out <- list()
+  for (f in fractions) {
+    vals <- data.frame(gamma = numeric(0), colless = numeric(0), sackin = numeric(0))
+    for (r in seq_len(nrep)) {
+      keep <- unlist(lapply(split(names(state_vec), state_vec), function(x) {
+        k <- max(2, floor(length(x) * f))
+        if (length(x) <= k) x else sample(x, k)
+      }))
+      if (length(keep) < 5) next
+      st <- tryCatch(collapse.singles(keep.tip(phy, keep)), error = function(e) NULL)
+      if (is.null(st)) next
+      gg <- tryCatch(if(Ntip(st)>=3) gammaStat(st) else NA_real_, error = function(e) NA_real_)
+      cc <- tryCatch(colless_index(st)$normalized, error = function(e) NA_real_)
+      ss <- tryCatch(sackin_index(st)$normalized, error = function(e) NA_real_)
+      vals <- rbind(vals, data.frame(gamma = gg, colless = cc, sackin = ss))
+    }
+    out[[as.character(f)]] <- vals
+  }
+  out
+}
+
+stratified_rarefaction_result <- NULL
+if (Ntip(tree_life) >= 20) {
+  stratified_rarefaction_result <- tryCatch(
+    stratified_rarefaction(tree_life, as.character(life_vec), RAREFACTION_FRACTIONS, N_SIM_RAREFACTION),
+    error = function(e) { cat("[NOTE] Stratified rarefaction failed:", conditionMessage(e), "\n"); NULL }
+  )
+}
+
+# --- Sampling fraction by lifestyle and optional known-species table -----------
+sampling_fraction_by_state <- NULL
+if (file.exists(KNOWN_SPECIES_FILE)) {
+  known_tab <- tryCatch(read.csv(KNOWN_SPECIES_FILE, stringsAsFactors = FALSE), error = function(e) NULL)
+  if (!is.null(known_tab) && all(c("Lifestyle", "Known_Species") %in% colnames(known_tab))) {
+    sampled_tab <- table(as.character(life_vec))
+    sampling_fraction_by_state <- merge(
+      data.frame(Lifestyle = names(sampled_tab), Sampled = as.integer(sampled_tab)),
+      known_tab[, c("Lifestyle", "Known_Species")], by = "Lifestyle", all.x = TRUE
+    )
+    sampling_fraction_by_state$rho <- sampling_fraction_by_state$Sampled / sampling_fraction_by_state$Known_Species
+  }
+}
+
+# --- Alternative root sensitivity --------------------------------------------
+root_sensitivity <- NULL
+if (Ntip(tree_life) >= 10) {
+  # اصلاح شده برای جلوگیری از خطای حد بالا و ایجاد NULL
+  root_candidates <- unique(c(
+    head(tree_life$tip.label[which(life_vec == "Free-living")], 5),
+    head(tree_life$tip.label[which(life_vec == "Parasitic")], 5)
+  ))
+  root_candidates <- root_candidates[!is.na(root_candidates)]
+  root_sensitivity <- lapply(root_candidates, function(tt) {
+    tr <- tryCatch(root(tree_life, outgroup = tt, resolve.root = TRUE), error = function(e) NULL)
+    if (is.null(tr)) return(NULL)
+    rs <- tryCatch(ace(life_vec[tr$tip.label], tr, type = "discrete", model = model_choice)$lik.anc[1, ], error = function(e) NULL)
+    list(outgroup = tt, root_state = rs, gamma = tryCatch(if (!is.null(tr$edge.length) && Ntip(tr) >= 3 && is.ultrametric(tr)) gammaStat(tr) else NA_real_, error = function(e) NA_real_))
+  })
+  root_sensitivity <- Filter(Negate(is.null), root_sensitivity)
+}
+
+# --- Bootstrap-tree sensitivity ------------------------------------------------
+bootstrap_sensitivity <- NULL
+if (file.exists(BOOTSTRAP_TREES_FILE)) {
+  bt <- tryCatch(read.tree(BOOTSTRAP_TREES_FILE), error = function(e) NULL)
+  if (!is.null(bt)) {
+    if (!is.list(bt)) bt <- list(bt)
+    if (length(bt) > N_SIM_BOOTSTRAP) bt <- bt[sample(seq_along(bt), N_SIM_BOOTSTRAP)]
+    vals <- lapply(bt, function(tr) {
+      keep <- intersect(tr$tip.label, tree_life$tip.label)
+      if (length(keep) < 10) return(NULL)
+      tr <- tryCatch(collapse.singles(keep.tip(tr, keep)), error = function(e) NULL)
+      if (is.null(tr)) return(NULL)
+      list(
+        n = Ntip(tr),
+        ultrametric = if (!is.null(tr$edge.length)) is.ultrametric(tr, tol = 1e-6) else FALSE,
+        gamma = tryCatch(if (!is.null(tr$edge.length) && Ntip(tr) >= 3 && is.ultrametric(tr)) gammaStat(tr) else NA_real_, error = function(e) NA_real_),
+        colless = tryCatch(colless_index(tr)$normalized, error = function(e) NA_real_),
+        sackin = tryCatch(sackin_index(tr)$normalized, error = function(e) NA_real_)
+      )
+    })
+    bootstrap_sensitivity <- vals[!sapply(vals, is.null)]
+  }
+}
+
+# --- Root-to-tip / rate-vs-time diagnostic -----------------------------------
+root_to_tip_diagnostic <- NULL
+if (!is.null(analysis_tree_time) && !is.null(analysis_tree_time$edge.length)) {
+  h <- node.depth.edgelength(analysis_tree_time)[seq_len(Ntip(analysis_tree_time))]
+  root_to_tip_diagnostic <- data.frame(Taxon = analysis_tree_time$tip.label, RootToTip = h)
+}
+
+# --- Alignment QC: composition heterogeneity and saturation proxy -------------
+composition_qc <- NULL
+saturation_qc <- NULL
+if (file.exists(ALIGNMENT_FILE)) {
+  aln <- tryCatch(read.phyDat(ALIGNMENT_FILE, format = "fasta", type = "DNA"), error = function(e) NULL)
+  if (!is.null(aln)) {
+    dna_mat <- as.character(aln)
+    comp_fun <- function(x) {
+      x <- toupper(x); x <- x[x %in% c("A", "C", "G", "T")]
+      if (!length(x)) return(c(A=NA,C=NA,G=NA,T=NA,GC=NA))
+      p <- table(factor(x, levels=c("A","C","G","T"))) / length(x)
+      c(A=p[1], C=p[2], G=p[3], T=p[4], GC=p[3]+p[2])
+    }
+    composition_qc <- do.call(rbind, lapply(seq_len(nrow(dna_mat)), function(i) comp_fun(dna_mat[i, ])))
+    rownames(composition_qc) <- rownames(dna_mat)
+    composition_qc <- as.data.frame(composition_qc)
+    composition_qc$GC_z <- as.numeric(scale(composition_qc$GC))
+    # A simple saturation screen: pairwise observed p-distance versus ML distance.
+    sat <- tryCatch({
+      dm_p <- dist.dna(as.DNAbin(dna_mat), model = "raw", pairwise.deletion = TRUE)
+      dm_ml <- cophenetic.phylo(tree_life)
+      common <- intersect(rownames(as.matrix(dm_p)), rownames(dm_ml))
+      vp <- as.vector(as.dist(as.matrix(dm_p)[common, common]))
+      vm <- as.vector(as.dist(dm_ml[common, common]))
+      ok <- is.finite(vp) & is.finite(vm)
+      data.frame(Spearman_rho = suppressWarnings(cor(vp[ok], vm[ok], method="spearman")), N_pairs=sum(ok))
+    }, error = function(e) NULL)
+    saturation_qc <- sat
+  }
+}
+
+# --- Marker-specific tree conflict --------------------------------------------
+marker_tree_results <- list()
+for (mk in names(MARKER_FILES)) {
+  ff <- MARKER_FILES[[mk]]
+  if (file.exists(ff)) {
+    trm <- tryCatch({
+      aln_m <- read.phyDat(ff, format="fasta", type="DNA")
+      dm <- dist.ml(aln_m)
+      nj(dm)
+    }, error = function(e) NULL)
+    if (!is.null(trm)) marker_tree_results[[mk]] <- trm
+  }
+}
+marker_rf_matrix <- NULL
+if (length(marker_tree_results) >= 2) {
+  nms <- names(marker_tree_results)
+  marker_rf_matrix <- matrix(NA_real_, length(nms), length(nms), dimnames=list(nms,nms))
+  for (i in seq_along(nms)) for (j in seq_along(nms)) {
+    a <- marker_tree_results[[i]]; b <- marker_tree_results[[j]]
+    common <- intersect(a$tip.label, b$tip.label)
+    if (length(common) >= 10) {
+      aa <- keep.tip(a, common); bb <- keep.tip(b, common)
+      marker_rf_matrix[i,j] <- tryCatch(RF.dist(aa, bb, normalize=TRUE), error=function(e) NA_real_)
+    }
+  }
+}
+
+# --- Site-heterogeneous model command generation (IQ-TREE upstream) ----------
+iqtree_commands <- c(
+  paste("iqtree2 -s", ALIGNMENT_FILE, "-m MFP -B 1000 --alrt 1000 -T AUTO -pre IQTREE_MFP"),
+  paste("iqtree2 -s", ALIGNMENT_FILE, "-m LG+C60+F+PMSF -B 1000 --alrt 1000 -T AUTO -pre IQTREE_C60"),
+  paste("iqtree2 -s", ALIGNMENT_FILE, "--symtest -T AUTO -pre IQTREE_SYMTEST")
+)
+writeLines(iqtree_commands, "IQTREE_robustness_commands.txt")
+
+# --- Formal best-model adequacy simulation ------------------------------------
+# If RPANDA has produced a time-dependent best model, simulate under that fitted
+# time-dependent rate function. Otherwise retain the original Yule/BD adequacy
+# simulation. This is an additive extension; the original calculations remain.
+simulate_under_rpanda_best <- function(phy, rp_fits, n_sim = 500) {
+  if (is.null(rp_fits) || is.null(rp_fits$fits)) return(list())
+  best_name <- names(which.min(rp_fits$aicc))
+  fit <- rp_fits$fits[[best_name]]
+  tot_time <- rp_fits$tot_time
+  f <- rp_fits$sampling_fraction
+  out <- vector("list", n_sim)
+  
+  if (best_name == "Constant_PureBirth") {
+    lambda <- as.numeric(fit$lamb_par[1])
+    for (i in seq_len(n_sim)) {
+      out[[i]] <- tryCatch(
+        collapse.singles(ape::rphylo(n=Ntip(phy), birth=lambda, death=0, T0=tot_time)),
+        error=function(e) NULL
+      )
+    }
+  } else if (best_name == "Exponential_PureBirth") {
+    lambda0 <- as.numeric(fit$lamb_par[1])
+    beta <- as.numeric(fit$lamb_par[2])
+    birth_fun <- function(t) lambda0 * exp(beta * t)
+    for (i in seq_len(n_sim)) {
+      out[[i]] <- tryCatch(
+        collapse.singles(ape::rphylo(n=Ntip(phy), birth=birth_fun, death=0, T0=tot_time)),
+        error=function(e) NULL
+      )
+    }
+  } else if (best_name == "Exponential_BirthDeath") {
+    lambda0 <- as.numeric(fit$lamb_par[1])
+    beta <- as.numeric(fit$lamb_par[2])
+    mu0 <- as.numeric(fit$mu_par[1])
+    birth_fun <- function(t) lambda0 * exp(beta * t)
+    death_fun <- function(t) pmax(0, mu0)
+    for (i in seq_len(n_sim)) {
+      out[[i]] <- tryCatch(
+        collapse.singles(ape::rphylo(n=Ntip(phy), birth=birth_fun, death=death_fun, T0=tot_time)),
+        error=function(e) NULL
+      )
+    }
+  }
+  out[!sapply(out, is.null)]
+}
+
+best_model_simulations <- NULL
+if (exists("rpanda_fits") && !is.null(rpanda_fits) && !is.null(analysis_tree_time)) {
+  best_model_simulations <- simulate_under_rpanda_best(analysis_tree_time, rpanda_fits, N_SIM_MODEL_ADEQUACY)
+}
+
+# Fallback to the original Yule/Birth-Death adequacy simulation if RPANDA was
+# unavailable. This preserves the original v9 calculation path.
+if (length(best_model_simulations) < 10 && !is.null(div_model_comparison) && !is.null(analysis_tree_time)) {
+  simulate_under_best_model <- function(phy, model_obj, n_sim = 500) {
+    if (is.null(model_obj)) return(list())
+    model <- model_obj$preferred_model
+    n <- Ntip(phy)
+    out <- vector("list", n_sim)
+    if (model == "Yule (pure birth)") {
+      for (i in seq_len(n_sim)) out[[i]] <- tryCatch(collapse.singles(rphylo(n=n, birth=1, death=0)), error=function(e) NULL)
+    } else {
+      bd <- tryCatch(birthdeath(phy), error=function(e) NULL)
+      b <- if (!is.null(bd) && !is.null(bd$para["b"])) as.numeric(bd$para["b"]) else 1
+      d <- if (!is.null(bd) && !is.null(bd$para["d"])) as.numeric(bd$para["d"]) else 0.1
+      if (!is.finite(b) || b <= 0) b <- 1
+      if (!is.finite(d) || d < 0 || d >= b) d <- 0.1*b
+      for (i in seq_len(n_sim)) out[[i]] <- tryCatch(collapse.singles(rphylo(n=n, birth=b, death=d)), error=function(e) NULL)
+    }
+    out[!sapply(out, is.null)]
+  }
+  best_model_simulations <- simulate_under_best_model(analysis_tree_time, div_model_comparison, N_SIM_MODEL_ADEQUACY)
+}
+
+model_adequacy_summary <- NULL
+if (length(best_model_simulations) > 10) {
+  sim_stats <- do.call(rbind, lapply(best_model_simulations, function(tr) {
+    c(gamma = tryCatch(if (Ntip(tr) >= 3) gammaStat(tr) else NA, error=function(e) NA),
+      colless = tryCatch(colless_index(tr)$normalized, error=function(e) NA),
+      sackin = tryCatch(sackin_index(tr)$normalized, error=function(e) NA))
+  }))
+  obs_gamma <- tryCatch(if(Ntip(analysis_tree_time) >= 3) gammaStat(analysis_tree_time) else NA_real_, error=function(e) NA_real_)
+  model_adequacy_summary <- data.frame(
+    observed_gamma = obs_gamma,
+    observed_colless = tryCatch(colless_index(analysis_tree_time)$normalized, error=function(e) NA),
+    observed_sackin = tryCatch(sackin_index(analysis_tree_time)$normalized, error=function(e) NA),
+    gamma_p_lower = mean(sim_stats[,"gamma"] <= obs_gamma, na.rm=TRUE),
+    gamma_null_low = quantile(sim_stats[,"gamma"], .025, na.rm=TRUE),
+    gamma_null_high = quantile(sim_stats[,"gamma"], .975, na.rm=TRUE),
+    colless_null_low = quantile(sim_stats[,"colless"], .025, na.rm=TRUE),
+    colless_null_high = quantile(sim_stats[,"colless"], .975, na.rm=TRUE),
+    sackin_null_low = quantile(sim_stats[,"sackin"], .025, na.rm=TRUE),
+    sackin_null_high = quantile(sim_stats[,"sackin"], .975, na.rm=TRUE),
+    n_sim = nrow(sim_stats)
+  )
+}
+
+# --- Formal time-dependent diversification models via RPANDA ------------------
+# RPANDA is used only with a validated ultrametric/time-calibrated tree.
+# The exponential speciation-rate model is the formal Early-Burst / declining-
+# through-time-rate test; t is measured backward from the present.
+RUN_RPANDA <- TRUE
+rpanda_fits <- NULL
+rpanda_result <- NULL
+if (RUN_RPANDA && !is.null(analysis_tree_time) && requireNamespace("RPANDA", quietly = TRUE)) {
+  rpanda_result <- tryCatch({
+    tot_time <- max(ape::node.age(analysis_tree_time)$ages, na.rm = TRUE)
+    f_use <- RHO_SAMPLING_FRACTION
+    if (!is.finite(f_use) || f_use <= 0 || f_use > 1) f_use <- 1
+    
+    # Model 1: constant pure-birth
+    f.lamb.cst <- function(t, y) y[1]
+    f.mu.zero <- function(t, y) 0
+    fit_cst <- RPANDA::fit_bd(
+      analysis_tree_time, tot_time, f.lamb.cst, f.mu.zero,
+      lamb_par = c(max(0.001, 1 / tot_time)), mu_par = c(),
+      f = f_use, cst.lamb = TRUE, fix.mu = TRUE, dt = 1e-3
+    )
+    fit_cst$model_label <- "Constant pure-birth"
+    
+    # Model 2: exponential time-varying speciation, no extinction.
+    # lambda(t) = lambda0 * exp(beta * t); beta > 0 means higher rates in the past
+    # and therefore a decline toward the present (Early-Burst-like pattern).
+    f.lamb.exp <- function(t, y) y[1] * exp(y[2] * t)
+    fit_exp <- RPANDA::fit_bd(
+      analysis_tree_time, tot_time, f.lamb.exp, f.mu.zero,
+      lamb_par = c(max(0.001, 1 / tot_time), 0.01), mu_par = c(),
+      f = f_use, expo.lamb = TRUE, fix.mu = TRUE, dt = 1e-3
+    )
+    fit_exp$model_label <- "Exponential time-varying pure-birth (Early-Burst test)"
+    
+    # Model 3: exponential speciation + constant extinction.
+    f.mu.cst <- function(t, y) y[1]
+    fit_exp_bd <- RPANDA::fit_bd(
+      analysis_tree_time, tot_time, f.lamb.exp, f.mu.cst,
+      lamb_par = c(max(0.001, 1 / tot_time), 0.01), mu_par = c(max(1e-5, 0.1 / tot_time)),
+      f = f_use, expo.lamb = TRUE, cst.mu = TRUE, dt = 1e-3
+    )
+    fit_exp_bd$model_label <- "Exponential time-varying birth-death"
+    
+    fits <- list(Constant_PureBirth = fit_cst, Exponential_PureBirth = fit_exp, Exponential_BirthDeath = fit_exp_bd)
+    aicc_vals <- sapply(fits, function(x) x$aicc)
+    dAICc <- aicc_vals - min(aicc_vals)
+    weights <- exp(-0.5 * dAICc) / sum(exp(-0.5 * dAICc))
+    rpanda_fits <<- list(fits=fits, aicc=aicc_vals, delta_aicc=dAICc, weights=weights, tot_time=tot_time, sampling_fraction=f_use)
+    
+    list(available=TRUE, note=sprintf("RPANDA fit_bd completed on a validated time tree; best model = %s.", names(which.min(aicc_vals))), fits=rpanda_fits)
+  }, error=function(e) list(available=FALSE, note=paste("RPANDA fit failed:", conditionMessage(e))))
+} else if (RUN_RPANDA) {
+  rpanda_result <- list(available=FALSE, note="RPANDA model fitting skipped: a validated ultrametric/time-calibrated tree and/or RPANDA package was unavailable.")
+}
+
+# --- Optional BiSSE / HiSSE analysis ------------------------------------------
+state_dependent_result <- NULL
+if (requireNamespace("diversitree", quietly=TRUE) && !is.null(analysis_tree_time)) {
+  state_dependent_result <- list(
+    BiSSE_available = TRUE,
+    note = "diversitree is installed. Trait-dependent diversification requires a dated tree and complete state/species sampling; fit BiSSE with CID/HiSSE null models before causal interpretation."
+  )
+}
+if (requireNamespace("hisse", quietly=TRUE) && !is.null(analysis_tree_time)) {
+  state_dependent_result$HiSSE_available <- TRUE
+}
+
+# --- Multiple-testing registry -------------------------------------------------
+multiple_testing_registry <- data.frame(
+  Test = c("Terminal branch length", "Marine vs terrestrial depth", "Gamma", "SIMMAP directionality"),
+  Family = c("branch/ecology", "habitat", "diversification", "ancestral-state"),
+  p_value = c(bl_wilcox$p.value, depth_pval, gamma_mccr$p_value_one_tailed, NA_real_),
+  stringsAsFactors = FALSE
+)
+multiple_testing_registry$BH_adjusted <- NA_real_
+for (fam in unique(multiple_testing_registry$Family)) {
+  ix <- which(multiple_testing_registry$Family == fam & is.finite(multiple_testing_registry$p_value))
+  if (length(ix)) multiple_testing_registry$BH_adjusted[ix] <- p.adjust(multiple_testing_registry$p_value[ix], method="BH")
+}
+write.csv(multiple_testing_registry, "Multiple_Testing_Registry_v10.csv", row.names=FALSE)
+
+# --- Save machine-readable robustness results ---------------------------------
+write.csv(as.data.frame(t(c(
+  imbalance_ratio = imbalance_ratio,
+  colless_normalized = colless_full$normalized,
+  sackin_normalized = sackin_full$normalized,
+  gamma_full = gamma_stat,
+  gamma_mccr_p = gamma_mccr$p_value_one_tailed
+))), "Core_Robustness_Summary_v10.csv", row.names=FALSE)
+
+# 4. GENERATING THE DYNAMIC & EXTENDED TEXT REPORT
+# ==============================================================================
+report_file <- "Macroevolutionary_Insights_Report_Extended_v10.txt"
+sink(report_file)
+
+cat("================================================================================\n")
+cat("    ADVANCED MACROEVOLUTIONARY INSIGHTS REPORT (NEMATODA MEGA-TREE) - v10      \n")
+cat("================================================================================\n\n")
+
+cat("METHODOLOGICAL CAVEATS (READ BEFORE INTERPRETING RESULTS BELOW)\n")
+cat("--------------------------------------------------------------------------------\n")
+cat("- Branch lengths in the input tree are", branch_unit_note, ".\n")
+cat(sprintf("- Tree ultrametricity: %s.\n", if (is_ultrametric_flag) "YES" else "NO (naive uncalibrated chronogram used only where explicitly labeled)"))
+cat(sprintf("- Assumed sampling fraction (rho) for Gamma/MCCR tests: %.3f (user-set; verify against known species counts).\n", RHO_SAMPLING_FRACTION))
+cat("- The following checks are NOT computable from this pruned tree alone and\n")
+cat("  must be verified upstream, in the alignment/tree-building pipeline:\n")
+cat("    * Long-branch attraction (requires taxon-removal + site-heterogeneous\n")
+cat("      model comparison, e.g., LG+C60+F+PMSF vs simpler models).\n")
+cat("    * Gene/marker conflict among 18S, 28S, ITS, COI (requires separate\n")
+cat("      single-locus trees and discordance tests).\n")
+cat("    * Geographic sampling bias.\n")
+cat("    * Curation circularity: if this tree topology was itself used to\n")
+cat("      decide which of the 45,369 raw 18S records to discard (35,654\n")
+cat("      removed), any conclusion drawn from the resulting topology should\n")
+cat("      be validated on an independent held-out dataset.\n")
+cat("    * Model adequacy beyond AIC (posterior predictive simulation).\n")
+cat("    * Multiple-testing correction across genus/clade-level tests.\n\n")
+
+cat("1. HOTSPOTS OF SECONDARY REVERSIONS (ANCESTRAL STATE RECONSTRUCTION)\n")
+cat("--------------------------------------------------------------------------------\n")
+cat(sprintf("Discrete-trait model selection (AICc): ER = %.2f, ARD = %.2f -> model used for SIMMAP: %s.\n",
+            aicc_er, aicc_ard, model_choice))
+cat(sprintf("Across %d stochastic character map replicates:\n", N_SIM_SIMMAP))
+cat(sprintf(" - Parasitic -> Free-living transitions: mean = %.2f, SD = %.2f, 95%% CI = [%.2f, %.2f]\n",
+            reversions_mean, reversions_sd, reversions_ci[1], reversions_ci[2]))
+cat(sprintf(" - Free-living -> Parasitic transitions: mean = %.2f, SD = %.2f, 95%% CI = [%.2f, %.2f]\n",
+            forward_mean, forward_sd, forward_ci[1], forward_ci[2]))
+cat(sprintf(" - Root-state probabilities under %s model (ace point estimate): %s\n",
+            model_choice, paste(sprintf("%s = %.3f", names(root_state_ace), root_state_ace), collapse = ", ")))
+if (length(hotspot_genera) > 0) {
+  cat("Genera containing BOTH free-living and parasitic tips (candidate labile lineages):\n")
+  cat(" -> ", paste(head(hotspot_genera, 8), collapse = ", "), "...\n")
+}
+cat("Interpretation: A non-trivial estimated rate of Parasitic -> Free-living\n")
+cat("transitions is inconsistent with strict, one-directional Dollo-like loss of\n")
+cat("free-living ability, PROVIDED the reconstruction is robust to model choice\n")
+cat("(compare the ER vs ARD AICc above) and to root-state uncertainty. This does\n")
+cat("NOT by itself 'mathematically refute' irreversibility in general terms; it\n")
+cat("is one dataset-specific reconstruction, sensitive to the choice of model,\n")
+cat("root prior, and taxon sampling. Report the CI, not just the mean.\n\n")
+
+cat("2. DEEP NODE RESOLUTION & MACRO-BIFURCATION\n")
+cat("--------------------------------------------------------------------------------\n")
+cat("The root divides the sampled taxa into two clades with the following dominant\n")
+cat("genera (dominance here reflects sampling composition, not necessarily\n")
+cat("evolutionary importance):\n")
+cat(sprintf(" - Super-Clade A (Dominant taxa: %s) — n = %d tips\n", paste(c1_dom_genera, collapse = ", "), clade1_size))
+cat(sprintf(" - Super-Clade B (Dominant taxa: %s) — n = %d tips\n", paste(c2_dom_genera, collapse = ", "), clade2_size))
+cat("Note: Resolution of deep nodes should be cross-checked against a bootstrap\n")
+cat("consensus (not just this single ML tree) before treating these bifurcations\n")
+cat("as settled; single-tree topologies can be sensitive to taxon sampling and\n")
+cat("alignment choices upstream of this script.\n\n")
+
+cat("3. TERMINAL BRANCH LENGTHS (SUBSTITUTIONS/SITE — NOT A RATE PER TIME UNIT)\n")
+cat("--------------------------------------------------------------------------------\n")
+cat(sprintf(" - Mean terminal branch length (Parasitic):   %.4f substitutions/site\n", mean_bl_para))
+cat(sprintf(" - Mean terminal branch length (Free-living): %.4f substitutions/site\n", mean_bl_free))
+cat(sprintf(" - Wilcoxon Rank-Sum Test: W = %.0f, p-value = %e\n", bl_wilcox$statistic, bl_wilcox$p.value))
+cat("IMPORTANT: these values are raw substitutions/site accumulated along each\n")
+cat("terminal branch. They are NOT directly comparable to a 'rate' (substitutions\n")
+cat("per site per unit time) unless each branch is first divided by its time\n")
+cat("duration from a calibrated chronogram. No such calibration is available/\n")
+cat("validated for this tree, so the statement below is deliberately framed as\n")
+cat("a description of the raw quantity, not a rate.\n")
+if (bl_wilcox$p.value > 0.05) {
+  cat("Result: No statistically significant difference in terminal branch length\n")
+  cat("(substitutions/site) between parasitic and free-living tips in this tree.\n\n")
+} else {
+  cat("Result: Terminal branch lengths (substitutions/site) differ significantly\n")
+  cat("between parasitic and free-living tips. Whether this reflects a genuine\n")
+  cat("difference in substitution rate, or differences in root-to-tip time span,\n")
+  cat("cannot be determined without a time-calibrated tree.\n\n")
+}
+
+cat("4. TREE IMBALANCE & DIVERSIFICATION DYNAMICS\n")
+cat("--------------------------------------------------------------------------------\n")
+cat(sprintf(" - Raw clade-size ratio (NOT a formal imbalance statistic): %.2f (Clade A: %d taxa vs Clade B: %d taxa)\n",
+            imbalance_ratio, clade1_size, clade2_size))
+cat(sprintf(" - Colless index: raw = %.1f, normalized = %.4f\n", colless_full$raw, colless_full$normalized))
+cat(sprintf(" - Sackin index:  raw = %.1f, normalized = %.4f\n", sackin_full$raw, sackin_full$normalized))
+cat(sprintf(" - Matched-subsampling check (%d reps, sample size forced equal to smaller clade, n=%d each):\n",
+            subsample_result$n_sim_used, subsample_result$min_size))
+cat(sprintf("     Gamma under matched sampling: mean = %.2f, SD = %.2f, 95%% CI = [%.2f, %.2f]\n",
+            subsample_result$gamma_mean, subsample_result$gamma_sd,
+            subsample_result$gamma_ci_2.5, subsample_result$gamma_ci_97.5))
+cat("   -> Compare this matched-sampling Gamma distribution to the full-tree Gamma\n")
+cat("      below. If the full-tree Gamma falls far outside this matched-sampling\n")
+cat("      distribution, the imbalance is not purely a sampling artifact; if it\n")
+cat("      falls within it, sampling imbalance is a plausible major contributor.\n\n")
+
+cat(sprintf(" - Pybus & Harvey's Gamma (full tree, as provided, %s): %s\n",
+            if (is_ultrametric_flag) "ultrametric" else "NON-ultrametric — exploratory only", 
+            if(is.na(gamma_stat)) "NA" else sprintf("%.4f", gamma_stat)))
+cat(sprintf("   MCCR null-model test (%d simulations, rho = %.3f):\n", gamma_mccr$n_sim_used, RHO_SAMPLING_FRACTION))
+cat(sprintf("     Null distribution mean = %.2f, 95%% null CI = [%.2f, %.2f], one-tailed p = %.4f\n",
+            gamma_mccr$null_mean, gamma_mccr$null_ci_2.5, gamma_mccr$null_ci_97.5, gamma_mccr$p_value_one_tailed))
+if (!is_ultrametric_flag) {
+  cat("   [CAVEAT] This tree is not ultrametric; the Gamma value and its null test\n")
+  cat("   above are reported for completeness but should NOT be used as primary\n")
+  cat("   evidence for or against Early Burst. See the naive-chronogram results\n")
+  cat("   below (if available) for a (still uncalibrated) time-scaled comparison.\n")
+}
+if (!is.na(gamma_chronogram)) {
+  cat(sprintf("\n - Gamma on NAIVE, uncalibrated chronogram (illustrative only): %.4f\n", gamma_chronogram))
+  if (!is.null(gamma_chronogram_mccr)) {
+    cat(sprintf("   MCCR null test on naive chronogram: null mean = %.2f, 95%% CI = [%.2f, %.2f], one-tailed p = %.4f\n",
+                gamma_chronogram_mccr$null_mean, gamma_chronogram_mccr$null_ci_2.5,
+                gamma_chronogram_mccr$null_ci_97.5, gamma_chronogram_mccr$p_value_one_tailed))
+  }
+  cat("   [CAVEAT] This chronogram has NO fossil or secondary calibration; treat\n")
+  cat("   strictly as a topology/rate-smoothing sensitivity check, not a dated tree.\n")
+}
+cat(sprintf("\n - Clade-specific Gamma: Super-Clade A = %s, Super-Clade B = %s\n",
+            if (is.na(gamma_clade1)) "NA" else sprintf("%.4f", gamma_clade1),
+            if (is.na(gamma_clade2)) "NA" else sprintf("%.4f", gamma_clade2)))
+if (!is.null(gamma_clade1_mccr)) {
+  cat(sprintf("     Clade A MCCR: null mean = %.2f, 95%% CI = [%.2f, %.2f], one-tailed p = %.4f\n",
+              gamma_clade1_mccr$null_mean, gamma_clade1_mccr$null_ci_2.5,
+              gamma_clade1_mccr$null_ci_97.5, gamma_clade1_mccr$p_value_one_tailed))
+}
+if (!is.null(gamma_clade2_mccr)) {
+  cat(sprintf("     Clade B MCCR: null mean = %.2f, 95%% CI = [%.2f, %.2f], one-tailed p = %.4f\n",
+              gamma_clade2_mccr$null_mean, gamma_clade2_mccr$null_ci_2.5,
+              gamma_clade2_mccr$null_ci_97.5, gamma_clade2_mccr$p_value_one_tailed))
+}
+
+if (!is.null(div_model_comparison)) {
+  cat("\n - Diversification model comparison (Yule vs Birth-Death), AICc:\n")
+  cat(sprintf("     Yule: logLik = %.2f, AICc = %.2f\n", div_model_comparison$yule_loglik, div_model_comparison$yule_aicc))
+  cat(sprintf("     Birth-Death: logLik = %.2f, AICc = %.2f\n", div_model_comparison$bd_loglik, div_model_comparison$bd_aicc))
+  cat(sprintf("     Preferred model: %s\n", div_model_comparison$preferred_model))
+  cat(sprintf("     Relative extinction rate (epsilon = d/b): %.3f, 95%% CI approx = [%.3f, %.3f]\n",
+              div_model_comparison$eps_estimate, div_model_comparison$eps_ci_low, div_model_comparison$eps_ci_high))
+  if (!is_ultrametric_flag) {
+    cat("     [CAVEAT] Fitted on the naive, uncalibrated chronogram — illustrative only.\n")
+  }
+} else {
+  cat("\n - Diversification model comparison not available (no ultrametric tree or\n")
+  cat("   usable chronogram could be constructed).\n")
+}
+
+cat(sprintf("\n - Lineage-through-time plot with pure-birth null envelope saved to: %s\n", ltt_plot_file))
+cat("   (Only generated if an ultrametric tree or naive chronogram was available.)\n\n")
+
+cat("Overall interpretation of Gamma: with n =", clade1_size + clade2_size,
+    "tips, even modest deviations from a constant-rate null can produce large\n")
+cat("Gamma magnitudes. The MCCR test above (which explicitly accounts for n and\n")
+cat("the assumed sampling fraction) is the appropriate basis for a significance\n")
+cat("claim, NOT the raw Gamma value in isolation. A significant, strongly negative\n")
+cat("MCCR-tested Gamma on an ultrametric, adequately calibrated tree is consistent\n")
+cat("with — but does not on its own prove — an early-burst diversification model;\n")
+cat("formal model comparison (birth-death, early-burst/declining-rate, piecewise)\n")
+cat("against this Gamma result is recommended as a next step.\n\n")
+
+cat("5. TAXONOMIC PARAPHYLY & MORPHOLOGICAL CONVERGENCE\n")
+cat("--------------------------------------------------------------------------------\n")
+cat(sprintf("Out of %d unique genera analyzed, %d were identified as structurally\n", length(unique_genera), length(sorted_paraphyly)))
+cat("paraphyletic/polyphyletic ON THIS SINGLE TREE.\n")
+if (length(sorted_paraphyly) > 0) {
+  cat("Top genera by structural intrusion severity (unrelated taxa nested within\n")
+  cat("their putative clade):\n")
+  cat(" -> ", paste(head(names(sorted_paraphyly), 8), collapse = ", "), "...\n")
+}
+cat("Interpretation: this pattern is CONSISTENT WITH morphological convergence or\n")
+cat("historical taxonomic error, but is not by itself proof of either — it could\n")
+cat("also reflect phylogenetic estimation error at poorly supported nodes. Cross-\n")
+cat("check paraphyletic genera against nodal support values before drawing\n")
+cat("taxonomic revision conclusions.\n\n")
+
+cat("6. HABITAT / HOST-GUILD CO-OCCURRENCE\n")
+cat("--------------------------------------------------------------------------------\n")
+if (guild_available) {
+  cat(sprintf("Using column '%s' as the guild/host indicator.\n", guild_col))
+  cat(sprintf("%d genera contain more than one guild/host category among sampled tips:\n", guild_summary_text$n_mixed_genera))
+  if (guild_summary_text$n_mixed_genera > 0) {
+    cat(" -> ", paste(guild_summary_text$mixed_genera, collapse = ", "), "...\n")
+  }
+  cat("Interpretation: co-occurrence of multiple guild/host categories within a\n")
+  cat("genus is DESCRIPTIVE evidence of ecological lability at that taxonomic\n")
+  cat("level. It does NOT by itself demonstrate repeated evolutionary host-jumping\n")
+  cat("events — that requires ancestral state reconstruction of the guild/host\n")
+  cat("trait on the tree (analogous to the Lifestyle SIMMAP above) with reported\n")
+  cat("transition counts and their uncertainty.\n\n")
+} else {
+  cat("No guild/host-range column (expected one of: ",
+      paste(guild_col_candidates, collapse = ", "), ") was found in the trait\n")
+  cat("data. Host-jumping / cross-kingdom claims are NOT reported here, because\n")
+  cat("they cannot be substantiated from the currently loaded data. To include\n")
+  cat("this analysis, add a guild/host-range column and re-run — ideally followed\n")
+  cat("by ancestral state reconstruction, not just tip-level proximity.\n\n")
+}
+
+cat("7. QUANTIFYING THE BASALITY OF MARINE TAXA\n")
+cat("--------------------------------------------------------------------------------\n")
+if (length(marine_genera) > 0) {
+  cat("Aquatic/marine genera mapped to the topology:\n -> ", paste(head(marine_genera, 8), collapse = ", "), "...\n")
+  cat(sprintf("\nTopological depth (number of nodes from root, NOT time):\n"))
+  cat(sprintf(" - Mean depth, marine taxa: %.2f nodes\n", marine_depth_mean))
+  cat(sprintf(" - Mean depth, terrestrial taxa: %.2f nodes\n", terrestrial_depth_mean))
+  if (!is.na(depth_pval)) {
+    cat(sprintf(" - Wilcoxon test (marine < terrestrial): p = %e\n", depth_pval))
+    if (depth_pval < 0.05) {
+      cat("Result: marine taxa are, on average, statistically significantly closer\n")
+      cat("to the root than terrestrial taxa in THIS topology. This is consistent\n")
+      cat("with a marine-origin hypothesis for the sampled lineages but, on a\n")
+      cat("non-time-calibrated tree, does not itself establish divergence timing.\n\n")
+    } else {
+      cat("Result: no significant difference in topological depth between marine\n")
+      cat("and terrestrial taxa across this tree.\n\n")
+    }
+  }
+} else {
+  cat("Marine basality analysis requires a 'Habitat_Label' column in the input data\n")
+  cat("(not found or no marine/aquatic taxa matched).\n\n")
+}
+
+cat("8. TOPOLOGICAL TRANSITION ZONES: PARASITIC <-> FREE-LIVING BOUNDARIES\n")
+cat("--------------------------------------------------------------------------------\n")
+if (!has_support_values) {
+  cat("[NOTE] tree_life$node.label does not contain usable support values\n")
+  cat("(bootstrap / UFboot / posterior probability). The relationships below are\n")
+  cat("therefore reported strictly as TOPOLOGICALLY ADJACENT TRANSITION ZONES, NOT\n")
+  cat("as confirmed sister-group relationships. To upgrade these to sister-group\n")
+  cat("claims, re-run this script on a tree file that carries node support values,\n")
+  cat("e.g. an IQ-TREE .treefile with UFboot/SH-aLRT annotations.\n\n")
+}
+if (length(unique_sisters) > 0) {
+  cat(sprintf("Boundaries with support >= %.1f (reported as SUPPORTED sister relationships):\n", SUPPORT_THRESHOLD))
+  for (s in head(unique_sisters, 10)) cat(sprintf("    * %s\n", s))
+  cat("\n")
+}
+if (length(unique_adjacent) > 0) {
+  cat("Boundaries WITHOUT sufficient support (reported as adjacent transition zones\n")
+  cat("only — do not cite these as sister-group relationships):\n")
+  for (s in head(unique_adjacent, 10)) cat(sprintf("    * %s\n", s))
+  cat("\n")
+}
+if (length(unique_sisters) == 0 && length(unique_adjacent) == 0) {
+  cat("No qualifying >90%/<10% parasitic-proportion boundary nodes were found\n")
+  cat("under the current thresholds.\n\n")
+}
+cat("Interpretation: candidate free-living lineages adjacent to parasitic clades\n")
+cat("are plausible sources of pre-adaptations for parasitism ONLY where the\n")
+cat("adjacency is topologically supported. Unsupported adjacency may simply\n")
+cat("reflect estimation uncertainty at that node.\n\n")
+
+cat("9. v10 ROBUSTNESS / SENSITIVITY EXTENSIONS")
+cat("\n--------------------------------------------------------------------------------\n")
+cat("All original v9 analyses above were retained. The following additional analyses are conditional on upstream inputs being available.\n")
+if (!is.null(time_tree)) {
+  cat(sprintf("[OK] Real ultrametric/time-calibrated tree loaded: %s; n = %d tips.\n", CALIBRATED_TREE_FILE, Ntip(time_tree)))
+  cat("Time-dependent diversification results should preferentially use this tree, not the naive chronogram.\n")
+} else {
+  cat("[WARNING] No validated time-calibrated tree was supplied. Gamma/LTT/diversification-rate inference remains provisional.\n")
+}
+if (!is.null(model_adequacy_summary)) {
+  cat(sprintf("Best-model parametric adequacy: gamma lower-tail p = %.4f; simulated Gamma 95%% interval = [%.3f, %.3f].\n", model_adequacy_summary$gamma_p_lower, model_adequacy_summary$gamma_null_low, model_adequacy_summary$gamma_null_high))
+  cat("This simulation uses the selected Yule/Birth-Death model rather than an unconditional Yule null.\n")
+} else {
+  cat("[NOTE] Best-model parametric adequacy could not be run because a validated time tree/model fit was unavailable.\n")
+}
+if (!is.null(sampling_fraction_by_state)) {
+  cat("Sampling fractions by lifestyle from Known_Species_Counts.csv:\n")
+  print(sampling_fraction_by_state)
+} else {
+  cat("[WARNING] No lifestyle-specific known-species sampling table was supplied. Global rho remains an assumption.\n")
+}
+if (!is.null(stratified_rarefaction_result)) {
+  cat("Stratified rarefaction was performed within lifestyle states at fractions 75%, 50%, and 25%.\n")
+} else cat("[NOTE] Stratified rarefaction was not available.\n")
+if (length(bootstrap_sensitivity) > 0) {
+  cat(sprintf("Bootstrap-tree sensitivity: %d trees analyzed.\n", length(bootstrap_sensitivity)))
+} else cat("[WARNING] No bootstrap-tree file was supplied; topology uncertainty was not propagated through downstream statistics.\n")
+if (!is.null(composition_qc)) {
+  cat(sprintf("Alignment composition QC completed for %d taxa. Mean GC = %.4f; SD GC = %.4f.\n", nrow(composition_qc), mean(composition_qc$GC, na.rm=TRUE), sd(composition_qc$GC, na.rm=TRUE)))
+} else cat("[WARNING] Alignment file unavailable; composition heterogeneity could not be evaluated.\n")
+if (!is.null(saturation_qc)) cat(sprintf("Saturation screen: Spearman association between raw p-distance and tree distance = %.4f (n pairs = %d).\n", saturation_qc$Spearman_rho, saturation_qc$N_pairs))
+if (length(marker_tree_results) > 0) {
+  cat(sprintf("Marker-specific preliminary trees available for: %s.\n", paste(names(marker_tree_results), collapse=", ")))
+  if (!is.null(marker_rf_matrix)) { cat("Normalized RF-distance matrix among marker trees:\n"); print(round(marker_rf_matrix, 3)) }
+} else cat("[WARNING] No marker-specific alignment files were supplied; gene/marker conflict remains unresolved.\n")
+cat("IQ-TREE robustness commands written to IQTREE_robustness_commands.txt for MFP, LG+C60+F+PMSF, and symmetry testing. These commands must be executed upstream; this R script does not silently claim that those analyses were run.\n")
+if (!is.null(rpanda_result)) cat("RPANDA status: ", rpanda_result$note, "\n") else cat("[NOTE] RPANDA not available; a formal Early-Burst/rate-decline likelihood model was not fit in this run.\n")
+if (!is.null(rpanda_fits)) {
+  cat("RPANDA model comparison (validated time tree):\n")
+  rp_tab <- data.frame(Model=names(rpanda_fits$fits), AICc=as.numeric(rpanda_fits$aicc), Delta_AICc=as.numeric(rpanda_fits$delta_aicc), Akaike_weight=as.numeric(rpanda_fits$weights))
+  print(rp_tab)
+  eb_name <- "Exponential_PureBirth"
+  eb_fit <- rpanda_fits$fits[[eb_name]]
+  if (!is.null(eb_fit)) cat(sprintf("Early-Burst exponential parameter beta = %.6g; beta > 0 corresponds to higher speciation in the deeper past under RPANDA\n", eb_fit$lamb_par[2]))
+}
+if (!is.null(state_dependent_result)) cat("State-dependent diversification package status: available; BiSSE/HiSSE fitting remains conditional on validated dated tree and sampling assumptions.\n") else cat("[NOTE] BiSSE/HiSSE packages or a validated dated tree were not available; trait-dependent diversification remains unresolved.\n")
+if (length(root_sensitivity) > 0) cat(sprintf("Root sensitivity: %d alternative outgroup-rooted reconstructions were evaluated.\n", length(root_sensitivity))) else cat("[WARNING] Root sensitivity could not be evaluated. Midpoint root remains the default for the original analysis.\n")
+cat("\nINTERPRETIVE RULE: topology imbalance, Gamma/LTT diversification pattern, and lifestyle-dependent diversification are separate hypotheses and must not be conflated. A negative Gamma does not by itself prove Early Burst, and a BiSSE association does not by itself prove that parasitism caused diversification.\n\n")
+cat("================================================================================\n")
+cat("END OF REPORT — remember to address the upstream methodological caveats\n")
+cat("listed at the top of this report before using these results in a manuscript.\n")
+cat("================================================================================\n")
+
+sink()
+
+cat("\n[+] Success! Extended report (with statistical caveats and null-model tests)\n")
+cat("    has been written to:", report_file, "\n")
+cat("[+] LTT plot (if generated) written to:", ltt_plot_file, "\n")
+
+
+# ==============================================================================
+# 5. COMPREHENSIVE DATA EXPORT (NEW & STRONGER SAVING MODULE)
+# ------------------------------------------------------------------------------
+# This module creates a dedicated directory and exports EVERY matrix, table,
+# processed tree, high-resolution plot, and the complete R environment workspace.
+# ==============================================================================
+cat("\n[+] Initiating comprehensive data export...\n")
+
+# Create a dedicated output folder
+out_dir <- "Comprehensive_Outputs_v10"
+dir.create(out_dir, showWarnings = FALSE)
+
+# --- 5.1 Export All Matrices, Summary Stats, and Tables as CSV ----------------
+cat(" -> Saving matrices and dataframes to CSV...\n")
+
+if (exists("count_mat") && !is.null(count_mat)) {
+  write.csv(count_mat, file.path(out_dir, "SIMMAP_Transition_Counts.csv"))
+}
+if (exists("genus_life_table") && !is.null(genus_life_table)) {
+  write.csv(as.data.frame(unclass(genus_life_table)), file.path(out_dir, "Genus_Lifestyle_Distribution.csv"))
+}
+if (exists("composition_qc") && !is.null(composition_qc)) {
+  write.csv(composition_qc, file.path(out_dir, "Alignment_Composition_QC.csv"))
+}
+if (exists("saturation_qc") && !is.null(saturation_qc)) {
+  write.csv(saturation_qc, file.path(out_dir, "Saturation_QC.csv"), row.names = FALSE)
+}
+if (exists("marker_rf_matrix") && !is.null(marker_rf_matrix)) {
+  write.csv(marker_rf_matrix, file.path(out_dir, "Marker_Tree_RF_Distances.csv"))
+}
+if (exists("model_adequacy_summary") && !is.null(model_adequacy_summary)) {
+  write.csv(model_adequacy_summary, file.path(out_dir, "Model_Adequacy_Summary.csv"), row.names = FALSE)
+}
+if (exists("rpanda_fits") && !is.null(rpanda_fits)) {
+  rp_tab_export <- data.frame(Model = names(rpanda_fits$fits), 
+                              AICc = as.numeric(rpanda_fits$aicc), 
+                              Delta_AICc = as.numeric(rpanda_fits$delta_aicc), 
+                              Akaike_weight = as.numeric(rpanda_fits$weights))
+  write.csv(rp_tab_export, file.path(out_dir, "RPANDA_Diversification_Models.csv"), row.names = FALSE)
+}
+if (exists("sampling_fraction_by_state") && !is.null(sampling_fraction_by_state)) {
+  write.csv(sampling_fraction_by_state, file.path(out_dir, "Sampling_Fraction_By_State.csv"), row.names = FALSE)
+}
+
+# --- 5.2 Export Processed Trees -----------------------------------------------
+cat(" -> Saving processed trees (Newick format)...\n")
+
+if (exists("tree_life") && !is.null(tree_life)) {
+  write.tree(tree_life, file.path(out_dir, "Processed_Topology_Tree_Life.nwk"))
+}
+if (exists("naive_chronogram") && !is.null(naive_chronogram)) {
+  write.tree(naive_chronogram, file.path(out_dir, "Processed_Naive_Chronogram.nwk"))
+}
+if (exists("analysis_tree_time") && !is.null(analysis_tree_time)) {
+  write.tree(analysis_tree_time, file.path(out_dir, "Primary_Analysis_Time_Tree.nwk"))
+}
+
+# --- 5.3 Export Publication-Quality Plots (PDF) -------------------------------
+cat(" -> Generating and saving high-resolution PDF plots...\n")
+
+# LTT Plot (High-Res PDF)
+if (exists("ltt_tree") && !is.null(ltt_tree)) {
+  pdf(file.path(out_dir, "LTT_Plot_Publication_Quality.pdf"), width = 8, height = 6)
+  
+  if (exists("null_trees") && length(null_trees) > 0) {
+    
+    # 1. Safely filter out any NULL/invalid elements from the null_trees list
+    if (inherits(null_trees, "phylo")) {
+      null_list <- list(null_trees)
+    } else {
+      null_list <- Filter(function(x) inherits(x, "phylo"), null_trees)
+    }
+    
+    if (length(null_list) > 0) {
+      # 2. Plot the empirical tree first to initialize the plot window and axes
+      ape::ltt.plot(ltt_tree, backward = TRUE, col = "red", lwd = 3,
+                    main = "Lineage-Through-Time (LTT) Plot with Null Envelope")
+      
+      # 3. Add all valid null trees as background lines
+      for (i in seq_along(null_list)) {
+        ape::ltt.lines(null_list[[i]], backward = TRUE, col = "grey80", lwd = 0.5)
+      }
+      
+      # 4. Redraw the empirical tree ON TOP so it isn't buried behind the grey lines
+      ape::ltt.lines(ltt_tree, backward = TRUE, col = "red", lwd = 3)
+      
+    } else {
+      # Fallback if no valid null trees are found
+      ape::ltt.plot(ltt_tree, backward = TRUE, col = "red", lwd = 3, 
+                    main = "Lineage-Through-Time (LTT) Plot")
+    }
+    
+  } else {
+    ape::ltt.plot(ltt_tree, backward = TRUE, col = "red", lwd = 3, 
+                  main = "Lineage-Through-Time (LTT) Plot")
+  }
+  
+  dev.off()
+}
+
+# Circular Tree Plot with Lifestyle Traits (High-Res PDF)
+if (exists("tree_life") && exists("life_vec")) {
+  pdf(file.path(out_dir, "Circular_Tree_with_Lifestyle_Traits.pdf"), width = 12, height = 12)
+  plot_colors <- ifelse(life_vec == "Parasitic", "#D55E00", "#0072B2") # Colorblind-friendly palette
+  plot(tree_life, type = "fan", show.tip.label = FALSE, edge.width = 0.3)
+  tiplabels(pch = 19, col = plot_colors, cex = 0.5)
+  legend("bottomleft", legend = c("Free-living", "Parasitic"), fill = c("#0072B2", "#D55E00"), border = NA, bty = "n")
+  dev.off()
+}
+
+# --- 5.4 Save the COMPLETE R Environment (.RData) -----------------------------
+# This is the most powerful backup. It saves all SIMMAP iterations, null models, 
+# and variables so you can load them later without re-running the heavy calculations.
+cat(" -> Saving the complete R workspace...\n")
+save.image(file = file.path(out_dir, "Complete_Macroevolution_Workspace.RData"))
+
+cat(sprintf("[++] ALL comprehensive outputs have been successfully saved to the '%s/' directory!\n", out_dir))

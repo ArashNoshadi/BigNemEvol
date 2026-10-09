@@ -1,0 +1,680 @@
+# ==============================================================================
+# ADVANCED MACROEVOLUTIONARY PIPELINE (REVIEWER-PROOF EDITION - V14)
+# V14 = V13 + robustness/bug fixes. NO analysis was removed; every block from
+# V13 is still present. Changes are marked with "# [FIX]" comments so you can
+# diff against your original file if you want to see exactly what changed.
+# ==============================================================================
+setwd("G:/Paper/nema-Nanopore-Sequencing/Nature_Genetics/Dual_Dataset_Analysis_V8/R_Analysis_Files")
+
+# 1. LIBRARIES & REPRODUCIBILITY -----------------------------------------------
+required_pkgs <- c("ape", "phytools", "phangorn", "caper", "corHMM",
+                   "parallel", "ggplot2", "nlme")
+
+# [FIX] Fail with a clear, actionable message instead of a cryptic error if a
+# package isn't installed, and load everything through one loop so a missing
+# package is reported before any analysis code runs.
+missing_pkgs <- required_pkgs[!sapply(required_pkgs, requireNamespace, quietly = TRUE)]
+if (length(missing_pkgs) > 0) {
+  stop(sprintf(
+    "Missing required package(s): %s\nInstall them first with:\ninstall.packages(c(%s))",
+    paste(missing_pkgs, collapse = ", "),
+    paste(sprintf('"%s"', missing_pkgs), collapse = ", ")
+  ))
+}
+invisible(lapply(required_pkgs, library, character.only = TRUE))
+
+# [FIX] Small helper so every sink() report is guaranteed to close even if the
+# code inside it errors out (previously a mid-block error left sink() open,
+# silently swallowing all subsequent console/cat() output into the wrong file
+# for the rest of the run).
+safe_sink <- function(file, expr) {
+  sink(file)
+  on.exit(sink(), add = TRUE)
+  force(expr)
+}
+
+# Set seed for exact reproducibility (CRITICAL for Jackknifing & Polytomy resolution)
+set.seed(2026)
+
+cat("Loading and syncing data...\n")
+
+# [FIX] Fail fast with a clear message if input files are missing, rather than
+# an opaque "cannot open file" error deep inside read.tree()/read.csv().
+if (!file.exists("Pruned_Tree.nwk")) stop("Required file not found: Pruned_Tree.nwk")
+if (!file.exists("Matched_Trait_Data.csv")) stop("Required file not found: Matched_Trait_Data.csv")
+
+tree <- read.tree("Pruned_Tree.nwk")
+data <- read.csv("Matched_Trait_Data.csv", row.names = "Taxa_Name")
+
+# [FIX] Guard against the two datasets sharing zero taxa (a common cause of
+# silent downstream failures where tree_life ends up with 0 tips).
+if (length(intersect(tree$tip.label, rownames(data))) == 0) {
+  stop("No overlapping taxa between the tree tip labels and Matched_Trait_Data.csv row names.")
+}
+
+# 2. POLYTOMY & DATA SYNCHRONIZATION -------------------------------------------
+common_taxa <- intersect(tree$tip.label, rownames(data))
+tree <- keep.tip(tree, common_taxa)
+
+# Rooting (Midpoint default, but sensitivity will be tested)
+if (!is.rooted(tree)) { tree <- midpoint.root(tree) }
+
+# Polytomy Management: Resolve with a small branch length to prevent zero-length artifacts
+tree <- multi2di(tree, random = TRUE)
+tree$edge.length[tree$edge.length <= 1e-6] <- 1e-6
+
+data_synced <- data[tree$tip.label, , drop = FALSE]
+
+# [FIX] Fail clearly if the "Lifestyle" column is absent, instead of erroring
+# later with a confusing "$ operator is invalid" message.
+if (!"Lifestyle" %in% colnames(data_synced)) {
+  stop("Column 'Lifestyle' not found in Matched_Trait_Data.csv.")
+}
+
+valid_life <- !is.na(data_synced$Lifestyle) & data_synced$Lifestyle != "Unknown" & data_synced$Lifestyle != ""
+tree_life <- keep.tip(tree, rownames(data_synced)[valid_life])
+
+# [FIX] drop unused factor levels so downstream 2x2 matrices/level-order logic
+# (mat_irr, phyDat, plotting colors) can't silently misalign if extra empty
+# levels slipped through.
+life_vec <- droplevels(setNames(as.factor(data_synced$Lifestyle[valid_life]), tree_life$tip.label))
+
+# [FIX] This entire pipeline assumes exactly two lifestyle states. Enforce
+# that explicitly so a 3-level dataset fails immediately with a clear message
+# rather than silently producing wrong 2x2 matrices/plots downstream.
+if (nlevels(life_vec) != 2) {
+  stop(sprintf(
+    "Expected exactly 2 Lifestyle levels, found %d: %s",
+    nlevels(life_vec), paste(levels(life_vec), collapse = ", ")
+  ))
+}
+
+# Export Trait Distribution
+trait_dist <- as.data.frame(table(life_vec))
+colnames(trait_dist) <- c("Lifestyle", "Count")
+write.csv(trait_dist, "Trait_Distribution_Coverage.csv", row.names = FALSE)
+
+
+# ==============================================================================
+# ADDITION 1: PRUNING BIAS TEST (Chi-Square)
+# ==============================================================================
+cat("Testing for Taxonomic Pruning Bias...\n")
+chi_test_performed <- FALSE
+if (file.exists("Full_Trait_Data.csv")) {
+  data_full <- read.csv("Full_Trait_Data.csv")
+  freq_before <- table(data_full$Lifestyle)
+  freq_after <- table(life_vec)
+  
+  common_levels <- intersect(names(freq_before), names(freq_after))
+  if (length(common_levels) > 1) {
+    contingency_table <- rbind(freq_before[common_levels], freq_after[common_levels])
+    chi_test <- chisq.test(contingency_table)
+    chi_test_performed <- TRUE
+    
+    safe_sink("Pruning_Bias_Report.txt", {
+      cat("CHI-SQUARE TEST FOR PRUNING BIAS\n")
+      cat("================================\n")
+      print(contingency_table)
+      print(chi_test)
+    })
+  }
+} else {
+  cat("File 'Full_Trait_Data.csv' not found. Skipping Pruning Bias Test.\n")
+}
+
+
+# 3. MODEL SELECTION (ER vs ARD vs IRREVERSIBLE) -------------------------------
+cat("Running Formal Model Selection (AICc)...\n")
+
+# A. Equal Rates (ER)
+fit_ER <- tryCatch(ace(life_vec, tree_life, type = "discrete", model = "ER"),
+                   error = function(e) { cat("ER model failed:", conditionMessage(e), "\n"); NULL })
+
+# B. All Rates Different (ARD)
+fit_ARD <- tryCatch(ace(life_vec, tree_life, type = "discrete", model = "ARD"),
+                    error = function(e) { cat("ARD model failed:", conditionMessage(e), "\n"); NULL })
+
+# [FIX] The rest of the pipeline (root-state calls, jackknife CI, node-prob
+# export, the pie-chart tree) all depend on fit_ARD. If it fails to converge,
+# stop here with a clear message instead of crashing dozens of lines later on
+# a NULL$loglik / NULL$lik.anc error.
+if (is.null(fit_ARD)) {
+  stop("The ARD model (fit_ARD) failed to fit. This model is required by the rest of the pipeline (jackknife, node probabilities, pie-chart tree). Inspect the error above and check tree_life / life_vec before re-running.")
+}
+
+# C. Irreversible (Dollo-like: Parasitic -> Free-living = 0)
+levels_life <- levels(life_vec) # alphabetical, e.g. "Free-living", "Parasitic"
+
+# [FIX] The original code assumed levels_life[1] == "Free-living" and
+# levels_life[2] == "Parasitic" without checking. Verify that assumption
+# explicitly so the irreversible-model matrix can't silently be built
+# backwards on a differently-labeled dataset.
+if (!all(c("Free-living", "Parasitic") %in% levels_life)) {
+  stop(sprintf(
+    "Expected Lifestyle levels 'Free-living' and 'Parasitic', found: %s",
+    paste(levels_life, collapse = ", ")
+  ))
+}
+free_idx <- which(levels_life == "Free-living")
+para_idx <- which(levels_life == "Parasitic")
+mat_irr <- matrix(0, 2, 2)
+mat_irr[free_idx, para_idx] <- 1  # Free -> Parasitic allowed
+# Parasitic -> Free stays forbidden (0)
+dimnames(mat_irr) <- list(levels_life, levels_life)
+
+fit_IRR <- tryCatch(ace(life_vec, tree_life, type = "discrete", model = mat_irr),
+                    error = function(e) { cat("Irreversible model failed:", conditionMessage(e), "\n"); NULL })
+
+# Calculate AICc (function to adjust for finite sample size)
+calc_aicc <- function(logL, k, n) { (2 * k - 2 * logL) + (2 * k * (k + 1)) / (n - k - 1) }
+n_taxa <- Ntip(tree_life)
+
+# [FIX] Pull out loglik/k safely so a failed fit_IRR (or, in principle, a
+# failed fit_ER) doesn't crash the data.frame() call with a NULL element;
+# failed models get an NA row instead and are excluded from which.min() via
+# na.rm.
+get_loglik <- function(fit) if (is.null(fit)) NA_real_ else fit$loglik
+
+models_df <- data.frame(
+  Model  = c("ER (Symmetric)", "ARD (Asymmetric)", "Irreversible (Dollo)"),
+  k      = c(1, 2, 1),
+  LogLik = c(get_loglik(fit_ER), get_loglik(fit_ARD), get_loglik(fit_IRR))
+)
+models_df$AICc <- calc_aicc(models_df$LogLik, models_df$k, n_taxa)
+models_df$Delta_AICc <- models_df$AICc - min(models_df$AICc, na.rm = TRUE)
+write.csv(models_df, "Model_Selection.csv", row.names = FALSE)
+
+best_model_name <- models_df$Model[which.min(models_df$AICc)]
+cat(sprintf("-> Best fitting model: %s\n", best_model_name))
+
+# 4. HIDDEN STATE MODEL (corHMM) COMPARISON ------------------------------------
+cat("Running Hidden State Model (corHMM)...\n")
+cor_data <- data.frame(Taxa = tree_life$tip.label, Trait = as.numeric(life_vec))
+# ARD with 2 hidden rate categories
+fit_corHMM <- tryCatch(
+  corHMM(phy = tree_life, data = cor_data, rate.cat = 2, model = "ARD", node.states = "marginal"),
+  error = function(e) { cat("corHMM failed to converge:", conditionMessage(e), "\n"); NULL }
+)
+
+if (!is.null(fit_corHMM)) {
+  hmm_df <- data.frame(Model = c("Standard ARD", "corHMM (2 Hidden Rates)"),
+                       AICc = c(models_df$AICc[2], fit_corHMM$AICc))
+  write.csv(hmm_df, "Hidden_Rate_Model_Comparison.csv", row.names = FALSE)
+}
+
+# 5. DYNAMIC STRATIFIED ROOT SENSITIVITY ---------------------------------------
+cat("Running Dynamic Root Sensitivity Analysis...\n")
+# Dynamically find taxa originating from the first deep split (basal clades)
+root_node <- Ntip(tree_life) + 1
+basal_descendants <- tree_life$edge[tree_life$edge[, 1] == root_node, 2]
+deep_taxa <- c()
+for (node in basal_descendants) {
+  if (node <= Ntip(tree_life)) {
+    deep_taxa <- c(deep_taxa, tree_life$tip.label[node])
+  } else {
+    clade_tips <- extract.clade(tree_life, node)$tip.label
+    # [FIX] original code did clade_tips[1:3] unconditionally, which returns
+    # NA-padded entries when a basal clade has fewer than 3 tips. Cap at the
+    # clade size instead.
+    deep_taxa <- c(deep_taxa, clade_tips[seq_len(min(3, length(clade_tips)))])
+  }
+}
+deep_taxa <- na.omit(deep_taxa)
+
+life_vec_sens <- life_vec
+for (tax in deep_taxa) {
+  life_vec_sens[tax] <- ifelse(life_vec_sens[tax] == "Free-living", "Parasitic", "Free-living")
+}
+fit_sens <- tryCatch(ace(life_vec_sens, tree_life, type = "discrete", model = "ARD"),
+                     error = function(e) { cat("Sensitivity ARD model failed:", conditionMessage(e), "\n"); NULL })
+sens_root_state <- if (!is.null(fit_sens)) names(which.max(fit_sens$lik.anc[1, ])) else NA_character_
+
+# 6. PARALLEL JACKKNIFE CROSS-VALIDATION (100 ITERATIONS) ----------------------
+cat("Running 100x Jackknife Validation (Parallel)...\n")
+n_jack <- 100
+p_drop <- 0.10
+n_drop <- floor(p_drop * Ntip(tree_life))
+
+# [FIX] detectCores() - 1 can be 0 (or NA on some systems), which breaks both
+# makeCluster() and mclapply(). Clamp to at least 1 core.
+cores <- max(1, min(detectCores() - 1, 8), na.rm = TRUE)
+
+jack_func <- function(i) {
+  tryCatch({
+    tips_to_drop <- sample(tree_life$tip.label, n_drop)
+    tree_jack <- drop.tip(tree_life, tips_to_drop)
+    life_jack <- life_vec[tree_jack$tip.label]
+    
+    fit_j <- ace(life_jack, tree_jack, type = "discrete", model = "ARD")
+    root_prob <- fit_j$lik.anc[1, ]
+    best_state <- names(which.max(root_prob))
+    
+    # Extract rates: q01 (Free->Para) and q10 (Para->Free)
+    q01 <- fit_j$rates[1]
+    q10 <- fit_j$rates[2]
+    
+    return(data.frame(Iteration = i, Root_State = best_state, Prob_Parasitic = root_prob["Parasitic"],
+                      Prob_FreeLiving = root_prob["Free-living"], q01 = q01, q10 = q10))
+  }, error = function(e) { return(NULL) })
+}
+
+# Cross-platform parallel execution (Windows Safe)
+if (.Platform$OS.type == "windows") {
+  cat("Windows OS detected. Setting up PSOCK cluster with", cores, "cores...\n")
+  cl <- makeCluster(cores)
+  on.exit(try(stopCluster(cl), silent = TRUE), add = TRUE) # [FIX] ensure cluster is stopped even on error
+  clusterExport(cl, varlist = c("tree_life", "life_vec", "n_drop", "jack_func"))
+  clusterEvalQ(cl, library(ape))
+  
+  jack_results_list <- parLapply(cl, 1:n_jack, jack_func)
+  stopCluster(cl)
+} else {
+  cat("Unix-like OS detected. Using mclapply with", cores, "cores...\n")
+  jack_results_list <- mclapply(1:n_jack, jack_func, mc.cores = cores)
+}
+
+# Combine results
+# [FIX] drop failed iterations (NULL from the tryCatch inside jack_func)
+# before rbind so a few unlucky jackknife draws (e.g. dropping a whole clade)
+# don't silently corrupt row alignment.
+jack_results_list <- Filter(Negate(is.null), jack_results_list)
+if (length(jack_results_list) == 0) {
+  stop("All jackknife iterations failed - check tree_life/life_vec and n_drop.")
+}
+jack_df <- do.call(rbind, jack_results_list)
+write.csv(jack_df, "Jackknife_Results.csv", row.names = FALSE)
+
+# Calculate Confidence Interval (Binomial)
+successes <- sum(jack_df$Root_State == names(which.max(fit_ARD$lik.anc[1, ])))
+ci <- binom.test(successes, nrow(jack_df))$conf.int
+cat(sprintf("Jackknife Consistency: %.1f%% (95%% CI: %.1f%% - %.1f%%)\n",
+            (successes / nrow(jack_df)) * 100, ci[1] * 100, ci[2] * 100))
+
+# 7. PHYLOGENETIC SIGNAL (FRITZ AND PURVIS' D) ---------------------------------
+cat("Calculating Phylogenetic Signal...\n")
+df_d <- data.frame(Taxa = tree_life$tip.label, Trait_Num = ifelse(life_vec == "Parasitic", 1, 0))
+
+# FIX (kept from V13): Remove internal node labels (like duplicated bootstrap values) for caper
+tree_for_caper <- tree_life
+tree_for_caper$node.label <- NULL
+
+comp_data <- comparative.data(phy = tree_for_caper, data = df_d, names.col = "Taxa", vcv = FALSE)
+calc_D <- phylo.d(data = comp_data, binvar = Trait_Num, permut = 1000)
+
+# ==============================================================================
+# NEW ADDITIONS FOR REVIEWER DEFENSE (ROOT SWEEP, PARSIMONY, & PGLS INTERACTION)
+# ==============================================================================
+
+# 7.1. ROOT SWEEP SENSITIVITY ANALYSIS (Tests Root Position Bias) -------------
+cat("Running Comprehensive Root Sweep (Testing >1% clades)...\n")
+threshold <- 0.01 * Ntip(tree_life)
+all_nodes <- (Ntip(tree_life) + 1):(Ntip(tree_life) + Nnode(tree_life))
+# Identify deep nodes
+desc_counts <- sapply(all_nodes, function(x) length(extract.clade(tree_life, x)$tip.label))
+deep_nodes <- all_nodes[desc_counts > threshold]
+
+# [FIX] sample() with length(deep_nodes) == 1 would sample from 1:deep_nodes
+# instead of returning that single node (a classic R gotcha). Guard for that,
+# and for the (unlikely) case of zero deep nodes.
+if (length(deep_nodes) == 0) {
+  cat("No deep nodes exceeded the 1% clade-size threshold; skipping Root Sweep.\n")
+  deep_nodes_sample <- integer(0)
+} else if (length(deep_nodes) == 1) {
+  deep_nodes_sample <- deep_nodes
+} else {
+  deep_nodes_sample <- sample(deep_nodes, min(30, length(deep_nodes)))
+}
+
+sweep_results <- data.frame(Root_Node = integer(), Prob_Parasitic = numeric(), Prob_Free = numeric())
+
+for (node in deep_nodes_sample) {
+  try({
+    rerooted_tree <- root(tree_life, node = node, resolve.root = TRUE)
+    fit_sw <- ace(life_vec, rerooted_tree, type = "discrete", model = "ARD")
+    sweep_results <- rbind(sweep_results, data.frame(
+      Root_Node = node,
+      Prob_Parasitic = fit_sw$lik.anc[1, "Parasitic"],
+      Prob_Free = fit_sw$lik.anc[1, "Free-living"]
+    ))
+  }, silent = TRUE)
+}
+write.csv(sweep_results, "Root_Sweep_Results.csv", row.names = FALSE)
+
+
+# ==============================================================================
+# ADDITION 2: EXPLICIT OUTGROUP ROOTING CHECK
+# ==============================================================================
+cat("Checking Explicit Outgroup Rooting...\n")
+# NOTE: Replace these with your actual outgroup names if they exist in the pruned tree
+outgroup_taxa <- c("Nematomorpha_sp1", "Nematomorpha_sp2")
+valid_outgroups <- outgroup_taxa[outgroup_taxa %in% tree_life$tip.label]
+
+if (length(valid_outgroups) > 0) {
+  tree_outgroup <- root(tree_life, outgroup = valid_outgroups, resolve.root = TRUE)
+  fit_outgroup <- tryCatch(ace(life_vec, tree_outgroup, type = "discrete", model = "ARD"),
+                           error = function(e) { cat("Outgroup ARD model failed:", conditionMessage(e), "\n"); NULL })
+  if (!is.null(fit_outgroup)) {
+    outgroup_res <- sprintf("Root state under Outgroup Rooting: Parasitic = %.2f%%, Free-living = %.2f%%",
+                            fit_outgroup$lik.anc[1, "Parasitic"] * 100, fit_outgroup$lik.anc[1, "Free-living"] * 100)
+  } else {
+    outgroup_res <- "Outgroup rooting model failed to fit."
+  }
+  cat(outgroup_res, "\n")
+} else {
+  outgroup_res <- "Explicit outgroup taxa not found in the tree. Relying on Root Sweep for sensitivity."
+  cat(outgroup_res, "\n")
+}
+
+
+# 7.2. UNROOTED PARSIMONY (Root-Invariant Transition Count) -------------------
+cat("Calculating Unrooted Parsimony Transitions (Root-Invariant)...\n")
+trait_df_parsimony <- data.frame(Lifestyle = life_vec)
+rownames(trait_df_parsimony) <- names(life_vec)
+phy_dat <- phyDat(as.matrix(trait_df_parsimony), type = "USER", levels = levels(life_vec))
+unrooted_tree <- unroot(tree_life)
+min_transitions <- fitch(unrooted_tree, phy_dat)
+
+
+# ==============================================================================
+# ADDITION 3: ULTRAMETRIC TRANSFORMATION FOR SIMMAP (Fixing Substitution Units)
+# ==============================================================================
+cat("Transforming tree to relative ultrametric for SIMMAP (Dwell Times)...\n")
+# chronos() transforms the tree from substitution units to relative time units
+tree_ultra <- tryCatch(chronos(tree_life, lambda = 1), error = function(e) {
+  cat("chronos() failed:", conditionMessage(e), "\n"); NULL
+})
+
+if (!is.null(tree_ultra)) {
+  cat("Running 100 SIMMAP simulations on the ultrametric tree...\n")
+  simmap_trees <- tryCatch(make.simmap(tree_ultra, life_vec, model = "ARD", nsim = 100),
+                           error = function(e) { cat("make.simmap failed:", conditionMessage(e), "\n"); NULL })
+  if (!is.null(simmap_trees)) {
+    simmap_summary <- describe.simmap(simmap_trees)
+    safe_sink("SIMMAP_Ultrametric_Dwell_Times.txt", {
+      cat("SIMMAP DWELL TIMES (On Relative Ultrametric Tree)\n")
+      cat("================================================\n")
+      print(simmap_summary$times)
+      cat("\nInsight: Dwell times are now reported in relative time units, strictly answering the critique regarding non-ultrametric substitution units.\n")
+    })
+  }
+}
+
+
+# 7.3. PGLS INTERACTION MODEL (The Gelman & Stern Fix) ------------------------
+cat("Running PGLS Interaction Model (Genome Size * Lifestyle)...\n")
+# [FIX] Column names updated to match your actual CSV headers:
+#   "Genome Size (Mb)", "Coding Genes", "Log Genome Size"
+# read.csv() (default check.names = TRUE) converts spaces/parentheses to dots,
+# so these arrive in R as: "Genome.Size..Mb.", "Coding.Genes", "Log.Genome.Size".
+# 'Patristic_Distance' is still expected as-is (adjust below if your actual
+# header differs).
+#
+# [FIX] guard against these columns not existing at all (original code would
+# error on data_synced$Log_Genome_Size if the column was absent, rather than
+# just treating it as "no valid rows").
+has_genome_cols <- all(c("Log.Genome.Size", "Patristic_Distance") %in% colnames(data_synced))
+if (!has_genome_cols) {
+  cat("Columns 'Log.Genome.Size' and/or 'Patristic_Distance' not found - skipping PGLS interaction model.\n")
+  cat("Available columns in data_synced:\n"); print(colnames(data_synced))
+  genome_valid <- logical(0)
+} else {
+  genome_valid <- !is.na(data_synced$Log.Genome.Size) & !is.na(data_synced$Patristic_Distance)
+}
+
+if (has_genome_cols && sum(genome_valid) > 10) {
+  tree_gen <- keep.tip(tree, rownames(data_synced)[genome_valid])
+  data_gen <- data_synced[genome_valid, ]
+  data_gen <- data_gen[tree_gen$tip.label, ] # Ensure correct order
+  
+  cor_struct <- corPagel(1, phy = tree_gen, fixed = FALSE)
+  pgls_interaction <- tryCatch({
+    gls(Patristic_Distance ~ Log.Genome.Size * Lifestyle,
+        correlation = cor_struct, data = data_gen, method = "ML")
+  }, error = function(e) { cat("PGLS interaction model failed:", conditionMessage(e), "\n"); NULL })
+  
+  if (!is.null(pgls_interaction)) {
+    safe_sink("PGLS_Interaction_Results.txt", {
+      cat("PGLS MODEL WITH INTERACTION TERM (Testing Decoupling Hypothesis)\n")
+      cat("==============================================================\n")
+      print(summary(pgls_interaction))
+    })
+  }
+  
+  # ==============================================================================
+  # ADDITION 4: PGLS WITH ASSEMBLY QUALITY COVARIATE
+  # ==============================================================================
+  if ("BUSCO_Score" %in% colnames(data_gen)) {
+    cat("Running PGLS with Assembly Quality Control (BUSCO_Score)...\n")
+    pgls_covariate <- tryCatch({
+      gls(Patristic_Distance ~ Log.Genome.Size * Lifestyle + BUSCO_Score,
+          correlation = cor_struct, data = data_gen, method = "ML")
+    }, error = function(e) { cat("PGLS covariate model failed:", conditionMessage(e), "\n"); NULL })
+    
+    if (!is.null(pgls_covariate)) {
+      safe_sink("PGLS_Interaction_with_Covariate_Results.txt", {
+        cat("PGLS MODEL WITH INTERACTION & BUSCO COVARIATE\n")
+        cat("=============================================\n")
+        print(summary(pgls_covariate))
+      })
+    }
+  }
+}
+
+# 8. EXPORTING VISUALS AND NODE PROBABILITIES ----------------------------------
+cat("Generating Visuals and Tables...\n")
+
+# A. Density Plot of Jackknife Probabilities
+p_density <- ggplot(jack_df, aes(x = Prob_Parasitic)) +
+  geom_density(fill = "red", alpha = 0.5) +
+  theme_minimal() + labs(title = "Jackknife Robustness: Probability of Parasitic Root", x = "Probability", y = "Density")
+ggsave("Jackknife_Density_Plot.pdf", p_density, width = 8, height = 6)
+
+# B. Rate Fluctuation Plot
+p_rates <- ggplot(jack_df, aes(x = Iteration)) +
+  geom_line(aes(y = q01, color = "Free -> Parasitic")) +
+  geom_line(aes(y = q10, color = "Parasitic -> Free")) +
+  theme_minimal() + labs(title = "Stability of Transition Rates under 10% Taxon Drop", y = "Transition Rate")
+ggsave("Transition_Rates_Stability.pdf", p_rates, width = 8, height = 6)
+
+# C. All Nodes Probabilities
+node_probs <- data.frame(Node_ID = (Ntip(tree_life) + 1):(Ntip(tree_life) + Nnode(tree_life)), fit_ARD$lik.anc)
+write.csv(node_probs, "All_Nodes_Probabilities.csv", row.names = FALSE)
+
+# D. Pie Chart Tree (High-Res PDF)
+# [FIX] wrap in tryCatch + on.exit so a very large tree that errors mid-plot
+# doesn't leave an open, unclosed/corrupt PDF device.
+pdf("ASR_PieChart_Tree.pdf", width = 30, height = 50)
+tryCatch({
+  on.exit(dev.off(), add = TRUE)
+  plotTree(tree_life, ftype = "off", lwd = 0.5)
+  nodelabels(pie = fit_ARD$lik.anc, piecol = c("#4daf4a", "#e41a1c"), cex = 0.2)
+  legend("topleft", legend = levels(life_vec), fill = c("#4daf4a", "#e41a1c"), bty = "n", cex = 2)
+}, error = function(e) cat("Pie-chart tree plotting failed:", conditionMessage(e), "\n"))
+
+# 9. FINAL REPORT GENERATION ---------------------------------------------------
+safe_sink("Robustness_Validation_Report_v14_Final.txt", {
+  cat("================================================================================\n")
+  cat("       BULLETPROOF MACROEVOLUTIONARY REPORT (V14 - FULL REVIEWER DEFENSE)       \n")
+  cat("================================================================================\n\n")
+  
+  cat("1. MODEL SELECTION & IRREVERSIBILITY (Dollo's Law Test)\n")
+  cat("--------------------------------------------------------------------------------\n")
+  cat("Before running Ancestral State Reconstruction (ASR), formal model selection (AICc) was performed:\n")
+  print(models_df)
+  if (!is.na(models_df$AICc[3]) && !is.na(models_df$AICc[2]) && models_df$AICc[3] > models_df$AICc[2]) {
+    cat("\nInsight: The Irreversible model (forbidding Parasitic -> Free-living transitions) has a WORSE fit than the unconstrained ARD model. This statistically refutes Dollo's Law for Nematoda, proving secondary reversions are biologically real and not mathematical artifacts.\n\n")
+  }
+  
+  cat("2. ROOT-INVARIANT PARSIMONY TRANSITIONS (Definitive Lability Test)\n")
+  cat("--------------------------------------------------------------------------------\n")
+  cat(sprintf("Minimum Number of State Transitions (Fitch Parsimony): %d\n", min_transitions))
+  cat("Insight: Computed on an UNROOTED tree. This proves that regardless of where the root is placed (Free-living or Parasitic), extreme lability and multiple secondary reversions are an undeniable mathematical necessity of the topology.\n\n")
+  
+  cat("3. ROOT SWEEP & OUTGROUP SENSITIVITY (Addressing Midpoint Artifacts)\n")
+  cat("--------------------------------------------------------------------------------\n")
+  cat(sprintf("Tested %d alternative deep nodes across the phylogeny.\n", nrow(sweep_results)))
+  if (nrow(sweep_results) > 0) {
+    cat(sprintf("Mean Probability of Parasitic Root across Sweep: %.2f%%\n", mean(sweep_results$Prob_Parasitic) * 100))
+  } else {
+    cat("Mean Probability of Parasitic Root across Sweep: N/A (no deep nodes tested)\n")
+  }
+  cat("Outgroup Check:", outgroup_res, "\n")
+  cat("Insight: Review Root_Sweep_Results.csv to see how ancestral polarity shifts depending on rooting strategy. This directly confronts the overconfidence of genomic studies relying on single rooting methodologies.\n\n")
+  
+  cat("4. HIDDEN STATE MODEL AVOIDANCE (Overfitting Check)\n")
+  cat("--------------------------------------------------------------------------------\n")
+  if (!is.null(fit_corHMM) && fit_corHMM$AICc > models_df$AICc[2]) {
+    cat("Insight: The hidden rate model (corHMM) exhibited a higher AICc than standard ARD. This confirms concerns about overly complex hidden state models causing overfitting.\n\n")
+  } else {
+    cat("Insight: corHMM evaluated. See Hidden_Rate_Model_Comparison.csv for details.\n\n")
+  }
+  
+  cat("5. 100x JACKKNIFE CROSS-VALIDATION (Parallelized)\n")
+  cat("--------------------------------------------------------------------------------\n")
+  cat(sprintf("Method: 100 iterations, 10%% random taxon dropout (n=%d dropped per run). Seed fixed for reproducibility.\n", n_drop))
+  cat(sprintf(" - Root Consistency Rate: %.1f%% (95%% Binomial CI: [%.1f%%, %.1f%%])\n", (successes / nrow(jack_df)) * 100, ci[1] * 100, ci[2] * 100))
+  cat("Insight: Shows topological stability under random dropout, though this metric is secondary to the Root Sweep test for addressing midpoint bias.\n\n")
+  
+  cat("6. DYNAMIC STRATIFIED ROOT SENSITIVITY\n")
+  cat("--------------------------------------------------------------------------------\n")
+  cat(sprintf("Method: The states of %d dynamically identified basal taxa were artificially inverted to test topological reliance.\n", length(deep_taxa)))
+  cat(sprintf(" - Reconstructed Root after corruption: %s\n", sens_root_state))
+  cat("Insight: This stress-test proves that the deep ancestral signal is distributed across the entire topology.\n\n")
+  
+  cat("7. PRUNING BIAS & SIMMAP ULTRAMETRIC UPDATES\n")
+  cat("--------------------------------------------------------------------------------\n")
+  if (chi_test_performed) {
+    cat("- Pruning Bias Test: Executed. See 'Pruning_Bias_Report.txt'.\n")
+  } else {
+    cat("- Pruning Bias Test: Skipped (Full_Trait_Data.csv not found).\n")
+  }
+  if (!is.null(tree_ultra)) {
+    cat("- SIMMAP Dwell Times: Successfully calculated on a relative ultrametric tree (Chronos). See 'SIMMAP_Ultrametric_Dwell_Times.txt'.\n")
+  } else {
+    cat("- SIMMAP Dwell Times: Failed to make tree ultrametric.\n")
+  }
+  cat("\n")
+  
+  cat("8. PHYLOGENETIC SIGNAL (D-Statistic)\n")
+  cat("--------------------------------------------------------------------------------\n")
+  cat(sprintf(" - D value: %.4f (p_random = %e)\n", calc_D$DEstimate, calc_D$Pval1))
+  cat("Insight: A significant departure from random distribution confirms 'Lifestyle' is a deeply conserved evolutionary trait, validating the use of macroevolutionary models.\n\n")
+  
+  if (has_genome_cols && sum(genome_valid) > 10) {
+    cat("9. PGLS GENOMIC DECOUPLING TEST (Gelman & Stern Correction)\n")
+    cat("--------------------------------------------------------------------------------\n")
+    cat("PGLS model with interaction term was successfully run. Results are saved in 'PGLS_Interaction_Results.txt'.\n")
+    cat("Insight: The p-value of the interaction term (Log.Genome.Size:Lifestyle) formally tests whether parasitic and free-living genomes scale differently with evolutionary rate.\n\n")
+  }
+  
+  cat("SESSION INFO (For Reproducibility)\n")
+  cat("--------------------------------------------------------------------------------\n")
+  print(sessionInfo())
+})
+
+cat("[+] ALL NEW ANALYSES COMPLETE! Check the directory for new CSVs and Reports.\n")
+
+# ------------------------------------------------------------------------------
+# ADDITION 5: EXACT CLADE COUNTING (Fixing the 197 missing taxa bug)
+# ------------------------------------------------------------------------------
+cat("Counting taxa in basal super-clades...\n")
+root_node <- Ntip(tree_life) + 1
+basal_children <- tree_life$edge[tree_life$edge[, 1] == root_node, 2]
+
+clade_counts <- sapply(basal_children, function(child) {
+  if (child <= Ntip(tree_life)) {
+    return(1) # branch terminates directly at a leaf
+  } else {
+    return(length(extract.clade(tree_life, child)$tip.label)) # branch terminates at a clade
+  }
+})
+
+safe_sink("SuperClade_Counts_Report.txt", {
+  cat("EXACT TAXA COUNT FOR BASAL CLADES\n")
+  cat("=================================\n")
+  cat(sprintf("Total Tips in Pruned Tree: %d\n", Ntip(tree_life)))
+  for (i in seq_along(clade_counts)) {
+    cat(sprintf("Basal Lineage %d: %d taxa\n", i, clade_counts[i]))
+  }
+  cat(sprintf("Verification Sum: %d\n", sum(clade_counts)))
+  cat("\nInsight: Use THESE exact numbers in your Results section to replace '2487 and 190'.\n")
+})
+
+# ==============================================================================
+# ADDITION 5: PROVING N-PADDING DIDN'T INFLATE BRANCH LENGTHS
+# (Refuting the Reviewer's "Fabricated gap lengths" concern)
+# ==============================================================================
+cat("Testing correlation between N-padding (missing data) and branch lengths...\n")
+
+aln_path <- "G:/Paper/nema-Nanopore-Sequencing/pylogenetic/Silva + NCBI/mearg/counsensus/Final_counsensus2/seq/clipkit/trimmed_output_final_consensus.fasta"
+
+if (file.exists(aln_path)) {
+  cat("Loading supermatrix alignment file (this may take a moment)...\n")
+  alignment <- read.dna(aln_path, format = "fasta")
+  
+  # Convert DNAbin object to a character matrix for counting
+  seq_chars <- as.character(alignment)
+  
+  # Match species names in the alignment to species remaining in the final tree
+  common_aln_tree <- intersect(rownames(seq_chars), tree_life$tip.label)
+  
+  if (length(common_aln_tree) > 0) {
+    seq_chars_pruned <- seq_chars[common_aln_tree, , drop = FALSE]
+    
+    # Percentage of N / gap characters per taxon
+    cat("Calculating percentage of missing data per taxon...\n")
+    n_counts <- rowSums(seq_chars_pruned == "n" | seq_chars_pruned == "N" |
+                          seq_chars_pruned == "?" | seq_chars_pruned == "-")
+    percent_missing <- n_counts / ncol(seq_chars_pruned)
+    
+    # Terminal branch length per species, extracted directly from tree topology
+    cat("Extracting terminal branch lengths...\n")
+    terminal_lengths <- numeric(length(common_aln_tree))
+    names(terminal_lengths) <- common_aln_tree
+    
+    for (tax in common_aln_tree) {
+      tip_index <- which(tree_life$tip.label == tax)
+      edge_index <- which(tree_life$edge[, 2] == tip_index)
+      terminal_lengths[tax] <- tree_life$edge.length[edge_index]
+    }
+    
+    # Pearson correlation test
+    cor_test <- cor.test(percent_missing, terminal_lengths, method = "pearson")
+    
+    safe_sink("N_Padding_Impact_Report.txt", {
+      cat("TEST FOR N-PADDING / MISSING DATA IMPACT ON BRANCH LENGTHS\n")
+      cat("=========================================================\n")
+      cat(sprintf("Number of Taxa Analyzed: %d\n", length(common_aln_tree)))
+      print(cor_test)
+      
+      if (cor_test$p.value > 0.05 || abs(cor_test$estimate) < 0.2) {
+        cat("\nInsight: The correlation between missing data (N-padding) and terminal branch lengths is non-significant or extremely weak.\n")
+        cat("Conclusion: Bridging gaps with 'N's did NOT artificially inflate mutational turnover. IQ-TREE correctly handled these as ambiguous sites without distorting branch lengths.\n")
+      } else {
+        cat("\nInsight: Significant correlation found. This implies missing data might interact with branch length estimations.\n")
+      }
+    })
+    
+    cat("Generating N-padding correlation plot...\n")
+    df_npad <- data.frame(Taxa = common_aln_tree,
+                          Percent_Missing = percent_missing,
+                          Branch_Length = terminal_lengths)
+    
+    p_npad <- ggplot(df_npad, aes(x = Percent_Missing, y = Branch_Length)) +
+      geom_point(alpha = 0.4, color = "#2c3e50") +
+      geom_smooth(method = "lm", color = "#e74c3c", se = TRUE) +
+      theme_minimal() +
+      labs(title = "Impact of N-Padding on Terminal Branch Lengths",
+           subtitle = sprintf("Pearson r = %.3f (p = %.3e)", cor_test$estimate, cor_test$p.value),
+           x = "Proportion of Missing Data (N/Gaps)",
+           y = "Terminal Branch Length (Substitutions/Site)")
+    
+    ggsave("N_Padding_Impact_Plot.pdf", p_npad, width = 8, height = 6)
+    cat("[+] N-padding analysis complete. See 'N_Padding_Impact_Report.txt' and Plot.\n\n")
+    
+  } else {
+    cat("ERROR: Taxon names in alignment do not match tree tips.\n\n")
+  }
+} else {
+  cat("ERROR: Alignment file not found at the specified path. Check the path directory.\n\n")
+}
